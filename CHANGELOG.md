@@ -16,3 +16,8 @@
 
 ## Nilor Feedback 1.0 / Nilor Dither 1.0
 - Initial CPU + DirectX 12 builds
+
+## Parked (2026-11-11)
+- Nilor Feedback uninstalled from AE 2027 (user call: iterating it took too long; using a
+  different approach for the trails). Source remains in the repo; the last version (1.5)
+  verified working in render-queue isolation tests. Nilor Dither stays installed and works.
