@@ -32,7 +32,7 @@
 #define DESCRIPTION "Recursive frame feedback: decay + transform the previous frame, composite under the current one."
 
 #define MAJOR_VERSION    1
-#define MINOR_VERSION    0
+#define MINOR_VERSION    3
 #define BUG_VERSION      0
 #define STAGE_VERSION    PF_Stage_RELEASE
 #define BUILD_VERSION    1
@@ -45,6 +45,7 @@ enum
     FB_ROTATE,
     FB_OFFSET_X,
     FB_OFFSET_Y,
+    FB_SOFTEN,
     FB_RESET,
     FB_NUM_PARAMS
 };
@@ -58,6 +59,9 @@ enum
 #define FB_OFF_MIN      -2000
 #define FB_OFF_MAX       2000
 #define FB_OFF_DFLT      0
+#define FB_SOFTEN_MIN    0
+#define FB_SOFTEN_MAX    100
+#define FB_SOFTEN_DFLT   0
 
 // kernel parameter block — field order must match the cbuffer in FeedbackKernel.hlsl
 typedef struct

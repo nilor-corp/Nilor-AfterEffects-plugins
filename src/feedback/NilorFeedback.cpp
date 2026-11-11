@@ -44,6 +44,7 @@ typedef struct
     float mRotate;   // degrees
     float mOffX;     // pixels
     float mOffY;     // pixels
+    float mSoften;   // pixels (0 = off); in-loop blur radius of the accumulator
 } FeedbackUserParams;
 
 // everything a cache entry for one frame depends on
@@ -138,12 +139,97 @@ static inline void ReadWorldPixel(const PF_EffectWorld* w, PF_PixelFormat fmt, A
 
 // ---------------------------------------------------------------- the composite
 
+// stage A (per row band): inverse-transform + bilinear-sample the previous frame into a
+// float scratch buffer (soften>0 path only — the blur then runs on this scratch)
+static void SamplePrevRows(
+    A_long y0, A_long y1,
+    const PF_EffectWorld* prevW,
+    float* scratch, A_long w, A_long h,
+    float m00, float m01, float m02, float m10, float m11, float m12)
+{
+    for (A_long y = y0; y < y1; y++)
+    {
+        float* row = scratch + (size_t)y * (size_t)w * 4;
+        for (A_long x = 0; x < w; x++, row += 4)
+        {
+            float fx = (float)x + 0.5f, fy = (float)y + 0.5f;
+            float px = m00 * fx + m01 * fy + m02 - 0.5f;
+            float py = m10 * fx + m11 * fy + m12 - 0.5f;
+            int x0 = (int)floorf(px), y0 = (int)floorf(py);
+            float tx = px - (float)x0, ty = py - (float)y0;
+            int x1 = x0 + 1, y1 = y0 + 1;
+            if (x0 < 0) x0 = 0; if (x0 > w - 1) x0 = w - 1;
+            if (x1 < 0) x1 = 0; if (x1 > w - 1) x1 = w - 1;
+            if (y0 < 0) y0 = 0; if (y0 > h - 1) y0 = h - 1;
+            if (y1 < 0) y1 = 0; if (y1 > h - 1) y1 = h - 1;
+
+            float c00[4], c10[4], c01[4], c11[4];
+            ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x0, y0, c00);
+            ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x1, y0, c10);
+            ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x0, y1, c01);
+            ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x1, y1, c11);
+            for (int c = 0; c < 4; c++)
+            {
+                float top = c00[c] + (c10[c] - c00[c]) * tx;
+                float bot = c01[c] + (c11[c] - c01[c]) * tx;
+                row[c] = top + (bot - top) * ty;
+            }
+        }
+    }
+}
+
+// separable gaussian on a float RGBA scratch buffer, one row/column band per thread
+static void BlurPassH(A_long y0, A_long y1, const float* srcBuf, float* dstBuf, A_long w, A_long h,
+                      const float* kernel, int radius)
+{
+    for (A_long y = y0; y < y1; y++)
+    {
+        const float* srow = srcBuf + (size_t)y * (size_t)w * 4;
+        float* drow = dstBuf + (size_t)y * (size_t)w * 4;
+        for (A_long x = 0; x < w; x++)
+        {
+            float acc[4] = {0, 0, 0, 0};
+            for (int k = -radius; k <= radius; k++)
+            {
+                A_long xx = x + k; if (xx < 0) xx = 0; if (xx > w - 1) xx = w - 1;
+                const float* sp = srow + (size_t)xx * 4;
+                float wgt = kernel[k + radius];
+                for (int c = 0; c < 4; c++) acc[c] += sp[c] * wgt;
+            }
+            for (int c = 0; c < 4; c++) drow[c] = acc[c];
+        }
+    }
+}
+
+static void BlurPassV(A_long x0, A_long x1, const float* srcBuf, float* dstBuf, A_long w, A_long h,
+                      const float* kernel, int radius)
+{
+    size_t stride = (size_t)w * 4;
+    for (A_long x = x0; x < x1; x++)
+    {
+        for (A_long y = 0; y < h; y++)
+        {
+            float acc[4] = {0, 0, 0, 0};
+            for (int k = -radius; k <= radius; k++)
+            {
+                A_long yy = y + k; if (yy < 0) yy = 0; if (yy > h - 1) yy = h - 1;
+                const float* sp = srcBuf + (size_t)yy * stride + (size_t)x * 4;
+                float wgt = kernel[k + radius];
+                for (int c = 0; c < 4; c++) acc[c] += sp[c] * wgt;
+            }
+            float* dp = dstBuf + (size_t)y * stride + (size_t)x * 4;
+            for (int c = 0; c < 4; c++) dp[c] = acc[c];
+        }
+    }
+}
+
 // one band of rows of the composite. out is ARGB64 (16-bit) — cached frames are 4x smaller
 // than float and trails don't need float precision.
 static void CompositeRows(
     A_long y0, A_long y1,
     const PF_EffectWorld* curW, PF_PixelFormat curFmt,
     const PF_EffectWorld* prevW, PF_Boolean hasPrev,
+    const float* softenedPrev,   // non-NULL: pre-sampled (and possibly blurred) accumulator
     PF_EffectWorld* outW,
     const FeedbackUserParams* up,
     float m00, float m01, float m02, float m10, float m11, float m12)
@@ -161,33 +247,46 @@ static void CompositeRows(
 
             if (hasPrev)
             {
-                float fx = (float)x + 0.5f, fy = (float)y + 0.5f;
-                float px = m00 * fx + m01 * fy + m02 - 0.5f;
-                float py = m10 * fx + m11 * fy + m12 - 0.5f;
-                int x0 = (int)floorf(px), y0 = (int)floorf(py);
-                float tx = px - (float)x0, ty = py - (float)y0;
-                int x1 = x0 + 1, y1 = y0 + 1;
-                if (x0 < 0) x0 = 0; if (x0 > w - 1) x0 = w - 1;
-                if (x1 < 0) x1 = 0; if (x1 > w - 1) x1 = w - 1;
                 A_long h = outW->height;
-                if (y0 < 0) y0 = 0; if (y0 > h - 1) y0 = h - 1;
-                if (y1 < 0) y1 = 0; if (y1 > h - 1) y1 = h - 1;
+                float v[4];
+                if (softenedPrev)
+                {
+                    // accumulator already sampled (+ blurred) by stage A/B
+                    const float* sp = softenedPrev + ((size_t)y * (size_t)w + (size_t)x) * 4;
+                    for (int c = 0; c < 4; c++) v[c] = sp[c] * up->mDecay;
+                }
+                else
+                {
+                    float fx = (float)x + 0.5f, fy = (float)y + 0.5f;
+                    float px = m00 * fx + m01 * fy + m02 - 0.5f;
+                    float py = m10 * fx + m11 * fy + m12 - 0.5f;
+                    int x0 = (int)floorf(px), y0 = (int)floorf(py);
+                    float tx = px - (float)x0, ty = py - (float)y0;
+                    int x1 = x0 + 1, y1 = y0 + 1;
+                    if (x0 < 0) x0 = 0; if (x0 > w - 1) x0 = w - 1;
+                    if (x1 < 0) x1 = 0; if (x1 > w - 1) x1 = w - 1;
+                    if (y0 < 0) y0 = 0; if (y0 > h - 1) y0 = h - 1;
+                    if (y1 < 0) y1 = 0; if (y1 > h - 1) y1 = h - 1;
 
-                float c00[4], c10[4], c01[4], c11[4];
-                ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x0, y0, c00);
-                ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x1, y0, c10);
-                ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x0, y1, c01);
-                ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x1, y1, c11);
+                    float c00[4], c10[4], c01[4], c11[4];
+                    ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x0, y0, c00);
+                    ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x1, y0, c10);
+                    ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x0, y1, c01);
+                    ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x1, y1, c11);
 
+                    for (int c = 0; c < 4; c++)
+                    {
+                        float top = c00[c] + (c10[c] - c00[c]) * tx;
+                        float bot = c01[c] + (c11[c] - c01[c]) * tx;
+                        v[c] = (top + (bot - top) * ty) * up->mDecay;
+                    }
+                }
                 for (int c = 0; c < 4; c++)
                 {
-                    float top = c00[c] + (c10[c] - c00[c]) * tx;
-                    float bot = c01[c] + (c11[c] - c01[c]) * tx;
-                    float v = (top + (bot - top) * ty) * up->mDecay;
-                    if (c == 3) oA = cur[3] + v * (1.f - cur[3]);
+                    if (c == 3) oA = cur[3] + v[3] * (1.f - cur[3]);
                     else
                     {
-                        float outc = cur[c] + v * (1.f - cur[3]);
+                        float outc = cur[c] + v[c] * (1.f - cur[3]);
                         if (c == 0) oR = outc; else if (c == 1) oG = outc; else oB = outc;
                     }
                 }
@@ -201,7 +300,7 @@ static void CompositeRows(
     }
 }
 
-// out = cur OVER (decay * transform(prev)), row-parallel
+// out = cur OVER (decay * transform(prev)), row-parallel; optional in-loop gaussian soften
 static void CompositeFrame(
     const PF_EffectWorld* curW, PF_PixelFormat curFmt,
     const PF_EffectWorld* prevW, PF_Boolean hasPrev,
@@ -217,25 +316,93 @@ static void CompositeFrame(
     if (nth == 0) nth = 4;
     nth = std::min(nth, 16u);
     if ((unsigned)h < nth * 64) nth = std::max(1u, (unsigned)(h / 64));
-
-    if (nth <= 1)
-    {
-        CompositeRows(0, h, curW, curFmt, prevW, hasPrev, outW, up, m00, m01, m02, m10, m11, m12);
-        return;
-    }
-
-    std::vector<std::thread> workers;
-    workers.reserve(nth);
+    if (nth < 1) nth = 1;
     A_long band = (h + (A_long)nth - 1) / (A_long)nth;
-    for (unsigned t = 0; t < nth; t++)
+
+    float* scratch = NULL;   // sampled accumulator
+    float* scratch2 = NULL;  // blur ping buffer
+
+    if (hasPrev && up->mSoften > 0.01f)
     {
-        A_long y0 = (A_long)t * band;
-        A_long y1 = std::min(h, y0 + band);
-        if (y0 >= y1) break;
-        workers.emplace_back(CompositeRows, y0, y1, curW, curFmt, prevW, hasPrev, outW, up,
-                             m00, m01, m02, m10, m11, m12);
+        size_t elems = (size_t)w * (size_t)h * 4;
+        scratch = (float*)malloc(elems * sizeof(float));
+        scratch2 = (float*)malloc(elems * sizeof(float));
+        if (scratch && scratch2)
+        {
+            // stage A: sample the accumulator through the transform
+            std::vector<std::thread> workers;
+            for (unsigned t = 0; t < nth; t++)
+            {
+                A_long y0 = (A_long)t * band;
+                A_long y1 = std::min(h, y0 + band);
+                if (y0 >= y1) break;
+                workers.emplace_back(SamplePrevRows, y0, y1, prevW, scratch, w, h,
+                                     m00, m01, m02, m10, m11, m12);
+            }
+            for (auto& t : workers) t.join();
+
+            // stage B: separable gaussian (sigma = px/2, radius = ceil(2.5*sigma))
+            float sigma = up->mSoften / 2.0f;
+            int radius = (int)ceilf(2.5f * sigma);
+            if (radius > 0)
+            {
+                std::vector<float> kernel(2 * radius + 1);
+                double sum = 0;
+                for (int k = -radius; k <= radius; k++)
+                {
+                    double v = exp(-(double)(k * k) / (2.0 * sigma * sigma));
+                    kernel[k + radius] = (float)v;
+                    sum += v;
+                }
+                for (size_t k = 0; k < kernel.size(); k++) kernel[k] = (float)(kernel[k] / sum);
+
+                std::vector<std::thread> w2;
+                for (unsigned t = 0; t < nth; t++)   // horizontal: row bands
+                {
+                    A_long y0 = (A_long)t * band;
+                    A_long y1 = std::min(h, y0 + band);
+                    if (y0 >= y1) break;
+                    w2.emplace_back(BlurPassH, y0, y1, (const float*)scratch, scratch2, w, h,
+                                    kernel.data(), radius);
+                }
+                for (auto& t : w2) t.join();
+
+                A_long xband = (w + (A_long)nth - 1) / (A_long)nth;
+                std::vector<std::thread> w3;
+                for (unsigned t = 0; t < nth; t++)   // vertical: column bands
+                {
+                    A_long x0 = (A_long)t * xband;
+                    A_long x1 = std::min(w, x0 + xband);
+                    if (x0 >= x1) break;
+                    w3.emplace_back(BlurPassV, x0, x1, (const float*)scratch2, scratch, w, h,
+                                    kernel.data(), radius);
+                }
+                for (auto& t : w3) t.join();
+            }
+        }
+        else
+        {
+            free(scratch); scratch = NULL;
+            free(scratch2); scratch2 = NULL;
+        }
     }
-    for (auto& t : workers) t.join();
+
+    // stage C: composite (softened scratch when present, direct sample otherwise)
+    {
+        std::vector<std::thread> workers;
+        for (unsigned t = 0; t < nth; t++)
+        {
+            A_long y0 = (A_long)t * band;
+            A_long y1 = std::min(h, y0 + band);
+            if (y0 >= y1) break;
+            workers.emplace_back(CompositeRows, y0, y1, curW, curFmt, prevW, hasPrev, scratch, outW, up,
+                                 m00, m01, m02, m10, m11, m12);
+        }
+        for (auto& t : workers) t.join();
+    }
+
+    free(scratch);
+    free(scratch2);
 }
 
 // ---------------------------------------------------------------- cache callbacks
@@ -462,6 +629,10 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
                          1, PF_ValueDisplayFlag_NONE, 0, FB_OFFSET_Y);
 
     AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Trail Soften", FB_SOFTEN_MIN, FB_SOFTEN_MAX, FB_SOFTEN_MIN, 20, FB_SOFTEN_DFLT,
+                         1, PF_ValueDisplayFlag_NONE, 0, FB_SOFTEN);
+
+    AEFX_CLR_STRUCT(def);
     PF_ADD_BUTTON("Reset Feedback", "Reset", FALSE, PF_ParamFlag_SUPERVISE, FB_RESET);
 
     out_data->num_params = FB_NUM_PARAMS;
@@ -508,6 +679,10 @@ static PF_Err PreRender(PF_InData* in_dataP, PF_OutData* out_dataP, PF_PreRender
     ERR(PF_CHECKOUT_PARAM(in_dataP, FB_OFFSET_Y, in_dataP->current_time, in_dataP->time_step,
                           in_dataP->time_scale, &cur_param));
     if (!err) up->mOffY = (float)cur_param.u.fs_d.value;
+
+    ERR(PF_CHECKOUT_PARAM(in_dataP, FB_SOFTEN, in_dataP->current_time, in_dataP->time_step,
+                          in_dataP->time_scale, &cur_param));
+    if (!err) up->mSoften = (float)cur_param.u.fs_d.value;
 
     if (err) { free(up); return err; }
 
