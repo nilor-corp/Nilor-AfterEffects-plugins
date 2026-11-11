@@ -87,10 +87,11 @@ typedef struct
     A_long width, height;
 } FBFrameValue;
 
-// global data: the reset generation counter (shared; only written on the UI thread)
+// global data: the reset generation counter + bake request (shared; only written on the UI thread)
 typedef struct
 {
-    A_long generation;
+    A_long     generation;
+    PF_Boolean bakeRequested;   // set by the Bake button; the next PreRender+SmartRender pair bakes
 } FBGlobal;
 
 static const char* kCacheClass = "com.nilor.feedback.frame.v1";
@@ -586,6 +587,7 @@ static PF_Err GlobalSetup(PF_InData* in_dataP, PF_OutData* out_data, PF_ParamDef
     {
         FBGlobal* g = (FBGlobal*)hs->host_lock_handle(gh);
         g->generation = 0;
+        g->bakeRequested = FALSE;
         hs->host_unlock_handle(gh);
         out_data->global_data = gh;
     }
@@ -657,6 +659,9 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     AEFX_CLR_STRUCT(def);
     PF_ADD_BUTTON("Reset Feedback", "Reset", FALSE, PF_ParamFlag_SUPERVISE, FB_RESET);
 
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_BUTTON("Bake Feedback (make scrubbable)", "Bake", FALSE, PF_ParamFlag_SUPERVISE, FB_BAKE);
+
     out_data->num_params = FB_NUM_PARAMS;
     return err;
 }
@@ -722,6 +727,34 @@ static PF_Err PreRender(PF_InData* in_dataP, PF_OutData* out_dataP, PF_PreRender
         UnionLRect(&in_result.result_rect, &extraP->output->result_rect);
         UnionLRect(&in_result.max_result_rect, &extraP->output->max_result_rect);
     }
+
+    // Bake requested? Declare every frame of the span as a wide-time dependency with a unique
+    // checkout id (frame index from span start). SmartRender pulls pixels by id. This is the
+    // documented wide-time pattern (checkout_layer at PreRender, checkout_layer_pixels at
+    // SmartRender) and the only way to get full-res past frames.
+    if (!err && in_dataP->global_data && in_dataP->time_step > 0)
+    {
+        AEFX_SuiteScoper<PF_HandleSuite1> hs =
+            AEFX_SuiteScoper<PF_HandleSuite1>(in_dataP, kPFHandleSuite, kPFHandleSuiteVersion1, out_dataP);
+        FBGlobal* g = (FBGlobal*)hs->host_lock_handle(in_dataP->global_data);
+        PF_Boolean bake = g->bakeRequested;
+        hs->host_unlock_handle(in_dataP->global_data);
+
+        if (bake)
+        {
+            A_long t0 = 0;
+            A_long t1 = t0 + in_dataP->total_time;
+            A_long id = 0;
+            for (A_long t = t0; t < t1 && !err; t += in_dataP->time_step, id++)
+            {
+                PF_CheckoutResult res;
+                AEFX_CLR_STRUCT(res);
+                ERR(extraP->cb->checkout_layer(in_dataP->effect_ref, FB_INPUT, id, &req, t,
+                                               in_dataP->time_step, in_dataP->time_scale, &res));
+            }
+            FBLog("[bake] declared %ld frame checkouts", (long)id);
+        }
+    }
     return err;
 }
 
@@ -776,6 +809,65 @@ static PF_Err SmartRender(PF_InData* in_dataP, PF_OutData* out_dataP, PF_SmartRe
     }
 
     ERR(paramUtils->PF_GetCurrentState(in_dataP->effect_ref, FB_INPUT, NULL, NULL, &o.inputState));
+
+    // bake pass: walk the whole span in order, composite each frame, cache it. After this,
+    // scrubbing to any frame hits the cache — the reason the button exists.
+    if (!err && in_dataP->global_data && in_dataP->time_step > 0)
+    {
+        PF_Boolean bake = FALSE;
+        FBGlobal* g = (FBGlobal*)hs->host_lock_handle(in_dataP->global_data);
+        bake = g->bakeRequested;
+        if (bake) g->bakeRequested = FALSE;   // single-shot; clones seeing TRUE first win
+        hs->host_unlock_handle(in_dataP->global_data);
+
+        if (bake)
+        {
+            A_long t0 = 0;
+            A_long t1 = t0 + in_dataP->total_time;
+            A_long total = (t1 - t0 + in_dataP->time_step - 1) / in_dataP->time_step;
+            A_long id = 0;
+            FBLog("[bake] start: %ld frames", (long)total);
+            for (A_long t = t0; t < t1 && !err; t += in_dataP->time_step, id++)
+            {
+                PF_EffectWorld* pix = NULL;
+                PF_Err perr = extraP->cb->checkout_layer_pixels(in_dataP->effect_ref, id, &pix);
+                if (perr != PF_Err_NONE || !pix)
+                {
+                    FBLog("[bake] no pixels for id=%ld err=%d", (long)id, (int)perr);
+                    continue;
+                }
+
+                FBOptions bo;
+                memset(&bo, 0, sizeof(bo));
+                bo.in_dataP = in_dataP;
+                bo.inWorld = pix;
+                ws->PF_GetPixelFormat(pix, &bo.inFmt);
+                bo.time = t;
+                bo.timeStep = in_dataP->time_step;
+                bo.timeScale = in_dataP->time_scale;
+                bo.params = *up;
+                bo.generation = o.generation;
+                bo.inputState = o.inputState;
+
+                AEGP_CCCheckoutReceiptP r = NULL;
+                cache->AEGP_ComputeIfNeededAndCheckout(kCacheClass, &bo, true, &r);
+                if (r) cache->AEGP_CheckinComputeReceipt(r);
+                extraP->cb->checkin_layer_pixels(in_dataP->effect_ref, id);
+
+                if ((id % 32) == 0)
+                {
+                    FBLog("[bake] %ld/%ld", (long)id, (long)total);
+                    if (in_dataP->inter.progress) in_dataP->inter.progress(in_dataP->effect_ref, (A_long)id, (A_long)total);
+                }
+                if (in_dataP->inter.abort && in_dataP->inter.abort(in_dataP->effect_ref))
+                {
+                    FBLog("[bake] aborted at %ld", (long)id);
+                    break;
+                }
+            }
+            FBLog("[bake] done (%ld frames)", (long)id);
+        }
+    }
 
     if (!err)
     {
@@ -850,15 +942,22 @@ static PF_Err SmartRender(PF_InData* in_dataP, PF_OutData* out_dataP, PF_SmartRe
 static PF_Err UserChangedParam(PF_InData* in_dataP, PF_OutData* out_dataP, const PF_UserChangedParamExtra* extraP)
 {
     PF_Err err = PF_Err_NONE;
-    if (extraP->param_index == FB_RESET && in_dataP->global_data)
+    if (!in_dataP->global_data) return err;
+    if (extraP->param_index != FB_RESET && extraP->param_index != FB_BAKE) return err;
+
+    AEFX_SuiteScoper<PF_HandleSuite1> hs =
+        AEFX_SuiteScoper<PF_HandleSuite1>(in_dataP, kPFHandleSuite, kPFHandleSuiteVersion1, out_dataP);
+    FBGlobal* g = (FBGlobal*)hs->host_lock_handle(in_dataP->global_data);
+    if (extraP->param_index == FB_RESET)
     {
-        AEFX_SuiteScoper<PF_HandleSuite1> hs =
-            AEFX_SuiteScoper<PF_HandleSuite1>(in_dataP, kPFHandleSuite, kPFHandleSuiteVersion1, out_dataP);
-        FBGlobal* g = (FBGlobal*)hs->host_lock_handle(in_dataP->global_data);
-        g->generation++;
-        hs->host_unlock_handle(in_dataP->global_data);
-        out_dataP->out_flags |= PF_OutFlag_FORCE_RERENDER;
+        g->generation++;             // keys change -> every cached frame invalidates
     }
+    else // FB_BAKE
+    {
+        g->bakeRequested = TRUE;     // next render walks the whole span into the cache
+    }
+    hs->host_unlock_handle(in_dataP->global_data);
+    out_dataP->out_flags |= PF_OutFlag_FORCE_RERENDER;
     return err;
 }
 
