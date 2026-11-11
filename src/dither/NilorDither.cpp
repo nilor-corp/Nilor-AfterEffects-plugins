@@ -309,6 +309,20 @@ static PF_Err PreRender(PF_InData* in_dataP, PF_OutData* out_dataP, PF_PreRender
 
     extraP->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
 
+    // AE requires result_rect + max_result_rect to be initialized at SMART_PRE_RENDER
+    {
+        PF_RenderRequest req = extraP->input->output_request;
+        PF_CheckoutResult in_result;
+        AEFX_CLR_STRUCT(in_result);
+        ERR(extraP->cb->checkout_layer(in_dataP->effect_ref, DITHER_INPUT, DITHER_INPUT, &req,
+                                       in_dataP->current_time, in_dataP->time_step, in_dataP->time_scale, &in_result));
+        if (!err)
+        {
+            UnionLRect(&in_result.result_rect, &extraP->output->result_rect);
+            UnionLRect(&in_result.max_result_rect, &extraP->output->max_result_rect);
+        }
+    }
+
     DitherParams* infoP = (DitherParams*)malloc(sizeof(DitherParams));
     if (!infoP) return PF_Err_OUT_OF_MEMORY;
     memset(infoP, 0, sizeof(DitherParams));
