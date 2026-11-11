@@ -15,7 +15,7 @@ struct DitherParams
     int   height;
     float levels;       // quantization steps per channel (e.g. 6)
     float strength;     // 0..1 blend toward the dithered result
-    int   matrixSize;   // 4 or 8 (Bayer matrix order)
+    int   matrixSize;   // 2, 4 or 8 (Bayer matrix order)
     float phase;        // 0..1 animation phase (shifts the matrix pattern)
 };
 
@@ -25,6 +25,11 @@ StructuredBuffer<float4>   src : register(t0);
 
 // explicit root signature: table order matches DXShaderExecution's CBV -> UAV -> SRV binding
 #define NILOR_RS "DescriptorTable(CBV(b0)), DescriptorTable(UAV(u0)), DescriptorTable(SRV(t0))"
+
+static const float bayer2[4] = {
+     0,  2,
+     3,  1
+};
 
 static const float bayer4[16] = {
      0,  8,  2, 10,
@@ -51,7 +56,7 @@ float bayerAt(int x, int y, int size, float phase)
     int shift = (int)(phase * (float)n2 * 1.61803398875f);
     int idx = ((y % size) * size + (x % size) + shift) % n2;
     if (idx < 0) idx += n2;
-    float v = (size == 4) ? bayer4[idx] : bayer8[idx];
+    float v = (size == 2) ? bayer2[idx] : ((size == 4) ? bayer4[idx] : bayer8[idx]);
     return v / (float)n2;   // 0..1
 }
 

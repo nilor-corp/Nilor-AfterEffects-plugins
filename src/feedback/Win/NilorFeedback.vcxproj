@@ -42,7 +42,6 @@
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>d3d12.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <SubSystem>Windows</SubSystem>
     </Link>
     <ResourceCompile>
@@ -50,15 +49,8 @@
     </ResourceCompile>
   </ItemDefinitionGroup>
 
-  <ItemGroup>
-    <CustomBuild Include="..\FeedbackKernel.hlsl">
-      <FileType>Document</FileType>
-      <Command>if not exist "$(IntDir)DirectX_Assets" mkdir "$(IntDir)DirectX_Assets"
-"$(DxcExe)" "%(FullPath)" -E main -Fo "$(IntDir)DirectX_Assets\FeedbackKernel.cso" -Frs "$(IntDir)DirectX_Assets\FeedbackKernel.rs" -T cs_6_5 -enable-16bit-types -ignore-line-directives</Command>
-      <Message>Compiling %(Filename).hlsl with dxc</Message>
-      <Outputs>$(IntDir)DirectX_Assets\FeedbackKernel.cso;$(IntDir)DirectX_Assets\FeedbackKernel.rs</Outputs>
-    </CustomBuild>
-  </ItemGroup>
+  <!-- v1.1 is CPU-only (see NilorFeedback.cpp header for why). FeedbackKernel.hlsl is kept in
+       the repo as the reference for a future GPU variant; it is intentionally NOT built. -->
 
   <ItemGroup>
     <CustomBuild Include="..\NilorFeedbackPiPL.r">
@@ -71,7 +63,6 @@ cl /D "MSWindows" /EP "$(IntDir)NilorFeedbackPiPL.rrc" &gt; "$(ProjectDir)NilorF
   </ItemGroup>
 
   <ItemGroup>
-    <ClCompile Include="$(AeSdkDir)\Util\DirectXUtils.cpp" />
     <ClCompile Include="$(AeSdkDir)\Util\Smart_Utils.cpp" />
     <ClCompile Include="..\NilorFeedback.cpp" />
   </ItemGroup>
@@ -80,11 +71,9 @@ cl /D "MSWindows" /EP "$(IntDir)NilorFeedbackPiPL.rrc" &gt; "$(ProjectDir)NilorF
   </ItemGroup>
 
   <Target Name="Ship" AfterTargets="Build">
-    <MakeDir Directories="$(NilorDistDir)DirectX_Assets" />
+    <MakeDir Directories="$(NilorDistDir)" />
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(NilorDistDir)" />
-    <Copy SourceFiles="$(IntDir)DirectX_Assets\FeedbackKernel.cso;$(IntDir)DirectX_Assets\FeedbackKernel.rs" DestinationFolder="$(NilorDistDir)DirectX_Assets" Condition="'$(Configuration)'=='Release'" />
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(AePluginsDir)" ContinueOnError="WarnAndContinue" Condition="'$(Configuration)'=='Release'" />
-    <Copy SourceFiles="$(IntDir)DirectX_Assets\FeedbackKernel.cso;$(IntDir)DirectX_Assets\FeedbackKernel.rs" DestinationFolder="$(AePluginsDir)\DirectX_Assets" ContinueOnError="WarnAndContinue" Condition="'$(Configuration)'=='Release'" />
   </Target>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

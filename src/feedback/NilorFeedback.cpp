@@ -1,56 +1,331 @@
-// Nilor Feedback — recursive frame feedback for After Effects.
-// CPU path (8/16/32f) + DirectX 12 compute path (GPU, float32).
+// Nilor Feedback v1.1 — recursive frame feedback for After Effects.
 //
-// The accumulator (previous output frame) lives in sequence data:
-//   - CPU path: a PF_Handle of float RGBA (tight pitch, converted per frame)
-//   - GPU path: two PF_EffectWorld ping-pong buffers created with CreateGPUWorld,
-//               read one + write the other inside the compute kernel, swap after.
-// Continuity: only sequential forward rendering accumulates. Time jumps, size or
-// device changes, and the Reset button all restart the accumulator at the current frame.
+//   out(t) = input(t)  OVER  (decay * transform(out(t-1)))     [premultiplied 'over']
+//
+// ARCHITECTURE (why this looks nothing like v1.0):
+// AE's multi-frame rendering replicates sequence data per render thread, so a per-instance
+// "previous frame" world can never work: frame N and N+1 land on different threads with
+// different clones. The supported mechanism for cross-frame state is AEGP_ComputeCacheSuite:
+// every rendered frame is cached globally (all threads, all clones) keyed by
+// (effect instance, time, params, input content hash, reset generation). Rendering frame T
+// checks out frame T-step, computing it recursively on a cache miss, so feedback is correct
+// in the viewer, RAM preview and render queue, under MFR or not.
+//
+// v1.1 composites on CPU. The compute kernel is trivial (~1 multiply + lerp per pixel);
+// a GPU variant can return later, but the cache value must be a CPU world anyway (values
+// outlive render calls and get freed on arbitrary threads, which GPU worlds must not).
+//
+// Continuity contract: feedback accumulates only over sequential frames. Scrubbing, seeking,
+// or the Reset button breaks the chain — the next frame starts fresh. Identical to the
+// TouchDesigner feedbackTOP behaviour this replaces.
 
 #include "NilorFeedback.h"
 
 #include "AEFX_SuiteHandlerTemplate.h"
-#include "AE_EffectGPUSuites.h"
+#include "AEGP_SuiteHandler.h"
+#include "AE_ComputeCacheSuite.h"
 #include "PrSDKPixelFormat.h"
 #include "String_Utils.h"
 #include "Smart_Utils.h"
-
-#ifdef AE_OS_WIN
-    #include "DirectXUtils.h"
-    // sample keeps this in its .cpp under #if HAS_HLSL; we are HLSL-only on Windows
-    inline PF_Err DXErr(bool inSuccess) { return inSuccess ? PF_Err_NONE : PF_Err_INTERNAL_STRUCT_DAMAGED; }
-    #define DX_ERR(FUNC) ERR(DXErr(FUNC))
-#endif
 
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
+// ---------------------------------------------------------------- params / state
+
+typedef struct
+{
+    float mDecay;    // 0..1
+    float mZoom;     // percent (100 = identity)
+    float mRotate;   // degrees
+    float mOffX;     // pixels
+    float mOffY;     // pixels
+} FeedbackUserParams;
+
+// everything a cache entry for one frame depends on
+typedef struct
+{
+    const PF_InData* in_dataP;    // valid during the SmartRender call that drives the compute chain
+    A_long           time;
+    A_long           timeStep;
+    A_u_long         timeScale;
+    A_long           generation;  // bump on Reset
+    FeedbackUserParams params;
+    PF_State         inputState;  // content identity of the source layer
+    int              depth;       // recursion guard
+} FBOptions;
+
+// cached value: one composited frame as a 32f ARGB CPU world
+typedef struct
+{
+    PF_EffectWorld* world;        // owned
+    const SPBasicSuite* pica;     // for disposal on purge (any thread)
+    A_long width, height;
+} FBFrameValue;
+
+// global data: the reset generation counter (shared; only written on the UI thread)
+typedef struct
+{
+    A_long generation;
+} FBGlobal;
+
+static const char* kCacheClass = "com.nilor.feedback.frame.v1";
+
+#define FB_MAX_DEPTH 4000   // recursion guard (70 s @ 60 fps); a longer chain resets instead
+
 // ---------------------------------------------------------------- helpers
 
 static inline float Clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
 
-// build the inverse of the user transform (translate + rotate + scale about the centre),
-// mapping output pixel -> source pixel in the accumulator
 static void BuildInverseTransform(
-    float cx, float cy,          // centre (pixels)
-    float offX, float offY,      // user offset (pixels)
-    float rotDeg,                // user rotation
-    float zoomPct,               // user zoom (100 = identity)
-    float* m00, float* m01, float* m02,
-    float* m10, float* m11, float* m12)
+    float cx, float cy, float offX, float offY, float rotDeg, float zoomPct,
+    float* m00, float* m01, float* m02, float* m10, float* m11, float* m12)
 {
     double r = rotDeg * 3.14159265358979323846 / 180.0;
-    double s = (zoomPct != 0.0f) ? (100.0 / zoomPct) : 1.0;   // inverse scale for the lookup
+    double s = (zoomPct != 0.0f) ? (100.0 / zoomPct) : 1.0;
     double cs = cos(r) * s, sn = sin(r) * s;
 
-    // forward: p' = R * S * (p - c) + c + off  →  inverse lookup: p = invS * R^T * (p' - c - off) + c
-    // write as p = M * p' + t
     *m00 = (float)cs;  *m01 = (float)sn;
     *m10 = (float)-sn; *m11 = (float)cs;
     *m02 = (float)(cx - cs * (cx + offX) - sn * (cy + offY));
     *m12 = (float)(cy + sn * (cx + offX) - cs * (cy + offY));
+}
+
+// FNV-1a over raw bytes into 128 bits
+static void HashBytes(AEGP_CCComputeKeyP key, const void* data, size_t len, A_long salt)
+{
+    const unsigned char* p = (const unsigned char*)data;
+    unsigned long long h0 = 1469598103934665603ULL ^ (unsigned long long)salt;
+    unsigned long long h1 = 1099511628211ULL ^ (unsigned long long)(salt * 2654435761u);
+    for (size_t i = 0; i < len; i++)
+    {
+        h0 = (h0 ^ p[i]) * 1099511628211ULL;
+        h1 = (h1 ^ (p[i] + (unsigned char)(i & 7))) * 14029467366897019727ULL;
+    }
+    key->bytes[0] = (A_long)(h0 & 0xFFFFFFFF);
+    key->bytes[1] = (A_long)(h0 >> 32);
+    key->bytes[2] = (A_long)(h1 & 0xFFFFFFFF);
+    key->bytes[3] = (A_long)(h1 >> 32);
+}
+
+// ---------------------------------------------------------------- pixel conversion
+
+static inline void ToFloat8(const PF_Pixel8* p, float* px)
+{ px[0] = p->red / 255.f; px[1] = p->green / 255.f; px[2] = p->blue / 255.f; px[3] = p->alpha / 255.f; }
+static inline void ToFloat16(const PF_Pixel16* p, float* px)
+{ px[0] = p->red / 32768.f; px[1] = p->green / 32768.f; px[2] = p->blue / 32768.f; px[3] = p->alpha / 32768.f; }
+static inline void ToFloat32(const PF_PixelFloat* p, float* px)
+{ px[0] = p->red; px[1] = p->green; px[2] = p->blue; px[3] = p->alpha; }
+
+// read a pixel from any supported world as float RGBA
+static inline void ReadWorldPixel(const PF_EffectWorld* w, PF_PixelFormat fmt, A_long x, A_long y, float* px)
+{
+    const char* row = (const char*)w->data + (size_t)y * (size_t)w->rowbytes;
+    switch (fmt)
+    {
+    case PF_PixelFormat_ARGB32:  ToFloat8(((const PF_Pixel8*)row) + x, px); break;
+    case PF_PixelFormat_ARGB64:  ToFloat16(((const PF_Pixel16*)row) + x, px); break;
+    case PF_PixelFormat_ARGB128: ToFloat32(((const PF_PixelFloat*)row) + x, px); break;
+    default: px[0] = px[1] = px[2] = px[3] = 0; break;
+    }
+}
+
+// ---------------------------------------------------------------- the composite
+
+// out = cur OVER (decay * transform(prev)), all float RGBA, premultiplied
+static void CompositeFrame(
+    const PF_EffectWorld* curW, PF_PixelFormat curFmt,
+    const PF_EffectWorld* prevW, PF_Boolean hasPrev,
+    PF_EffectWorld* outW,
+    const FeedbackUserParams* up)
+{
+    A_long w = outW->width, h = outW->height;
+    float m00, m01, m02, m10, m11, m12;
+    BuildInverseTransform(w * 0.5f, h * 0.5f, up->mOffX, up->mOffY, up->mRotate, up->mZoom,
+                          &m00, &m01, &m02, &m10, &m11, &m12);
+
+    for (A_long y = 0; y < h; y++)
+    {
+        PF_PixelFloat* dst = (PF_PixelFloat*)((char*)outW->data + (size_t)y * (size_t)outW->rowbytes);
+        for (A_long x = 0; x < w; x++, dst++)
+        {
+            float cur[4];
+            ReadWorldPixel(curW, curFmt, x, y, cur);
+
+            float oR = cur[0], oG = cur[1], oB = cur[2], oA = cur[3];
+
+            if (hasPrev)
+            {
+                float fx = (float)x + 0.5f, fy = (float)y + 0.5f;
+                float px = m00 * fx + m01 * fy + m02 - 0.5f;
+                float py = m10 * fx + m11 * fy + m12 - 0.5f;
+                int x0 = (int)floorf(px), y0 = (int)floorf(py);
+                float tx = px - (float)x0, ty = py - (float)y0;
+                int x1 = x0 + 1, y1 = y0 + 1;
+                if (x0 < 0) x0 = 0; if (x0 > w - 1) x0 = w - 1;
+                if (x1 < 0) x1 = 0; if (x1 > w - 1) x1 = w - 1;
+                if (y0 < 0) y0 = 0; if (y0 > h - 1) y0 = h - 1;
+                if (y1 < 0) y1 = 0; if (y1 > h - 1) y1 = h - 1;
+
+                float c00[4], c10[4], c01[4], c11[4];
+                ReadWorldPixel(prevW, PF_PixelFormat_ARGB128, x0, y0, c00);
+                ReadWorldPixel(prevW, PF_PixelFormat_ARGB128, x1, y0, c10);
+                ReadWorldPixel(prevW, PF_PixelFormat_ARGB128, x0, y1, c01);
+                ReadWorldPixel(prevW, PF_PixelFormat_ARGB128, x1, y1, c11);
+
+                for (int c = 0; c < 4; c++)
+                {
+                    float top = c00[c] + (c10[c] - c00[c]) * tx;
+                    float bot = c01[c] + (c11[c] - c01[c]) * tx;
+                    float v = (top + (bot - top) * ty) * up->mDecay;
+                    if (c == 3) oA = cur[3] + v * (1.f - cur[3]);
+                    else
+                    {
+                        float outc = cur[c] + v * (1.f - cur[3]);
+                        if (c == 0) oR = outc; else if (c == 1) oG = outc; else oB = outc;
+                    }
+                }
+            }
+
+            dst->red = oR; dst->green = oG; dst->blue = oB; dst->alpha = oA;
+        }
+    }
+}
+
+// ---------------------------------------------------------------- cache callbacks
+
+static A_Err FBGenerateKey(AEGP_CCComputeOptionsRefconP optionsP, AEGP_CCComputeKeyP out_keyP)
+{
+    FBOptions* o = (FBOptions*)optionsP;
+    // the key must capture: which instance, which frame, which params, what content, which reset era
+    HashBytes(out_keyP, &o->in_dataP->effect_ref, sizeof(o->in_dataP->effect_ref), 11);
+    HashBytes(out_keyP, &o->time, sizeof(o->time), out_keyP->bytes[0]);
+    HashBytes(out_keyP, &o->timeStep, sizeof(o->timeStep), out_keyP->bytes[1]);
+    HashBytes(out_keyP, &o->generation, sizeof(o->generation), out_keyP->bytes[2]);
+    HashBytes(out_keyP, &o->params, sizeof(o->params), out_keyP->bytes[3]);
+    HashBytes(out_keyP, &o->inputState, sizeof(o->inputState), 77);
+    return A_Err_NONE;
+}
+
+// forward decl for recursion
+static PF_Err FBComputeFrame(FBOptions* o, PF_EffectWorld** outWorldPP);
+
+static A_Err FBCompute(AEGP_CCComputeOptionsRefconP optionsP, AEGP_CCComputeValueRefconP* out_valuePP)
+{
+    FBOptions* o = (FBOptions*)optionsP;
+    PF_Err err = PF_Err_NONE;
+
+    PF_EffectWorld* world = NULL;
+    err = FBComputeFrame(o, &world);
+    if (err || !world) return (A_Err)err;
+
+    FBFrameValue* v = (FBFrameValue*)malloc(sizeof(FBFrameValue));
+    if (!v) return A_Err_ALLOC;
+    v->world = world;
+    v->pica = o->in_dataP->pica_basicP;
+    v->width = world->width;
+    v->height = world->height;
+    *out_valuePP = v;
+    return A_Err_NONE;
+}
+
+static size_t FBApproxSize(AEGP_CCComputeValueRefconP valueP)
+{
+    FBFrameValue* v = (FBFrameValue*)valueP;
+    return v ? (size_t)v->width * (size_t)v->height * 16 : 0;
+}
+
+static void FBDeleteValue(AEGP_CCComputeValueRefconP valueP)
+{
+    FBFrameValue* v = (FBFrameValue*)valueP;
+    if (!v) return;
+    if (v->world && v->pica)
+    {
+        AEFX_SuiteScoper<PF_WorldSuite2> ws(const_cast<SPBasicSuite*>(v->pica), kPFWorldSuite, kPFWorldSuiteVersion2);
+        ws->PF_DisposeWorld(NULL, v->world);
+        free(v->world);   // the struct itself is ours (PF_NewWorld fills, doesn't allocate it)
+    }
+    free(v);
+}
+
+// render one frame into a fresh ARGB128 world (checkout input at that time, pull the
+// previous frame from the cache — computing it recursively on a miss)
+static PF_Err FBComputeFrame(FBOptions* o, PF_EffectWorld** outWorldPP)
+{
+    PF_Err err = PF_Err_NONE;
+    const PF_InData* in_dataP = o->in_dataP;
+
+    AEFX_SuiteScoper<PF_WorldSuite2> ws(const_cast<SPBasicSuite*>(in_dataP->pica_basicP), kPFWorldSuite, kPFWorldSuiteVersion2);
+    AEFX_SuiteScoper<AEGP_ComputeCacheSuite1> cache(
+        const_cast<SPBasicSuite*>(in_dataP->pica_basicP), kAEGPComputeCacheSuite, kAEGPComputeCacheSuiteVersion1);
+
+    // current input at time o->time (checkout by param index works for arbitrary times)
+    PF_ParamDef cur_def;
+    AEFX_CLR_STRUCT(cur_def);
+    ERR((in_dataP->inter.checkout_param)(
+        in_dataP->effect_ref, FB_INPUT, o->time, o->timeStep, o->timeScale, &cur_def));
+    if (err) return err;
+
+    PF_EffectWorld* curW = &cur_def.u.ld;
+    PF_PixelFormat curFmt = PF_PixelFormat_INVALID;
+    ERR(ws->PF_GetPixelFormat(curW, &curFmt));
+
+    A_long w = curW->width, h = curW->height;
+    if (w <= 0 || h <= 0)
+    {
+        (in_dataP->inter.checkin_param)(in_dataP->effect_ref, &cur_def);
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+
+    // previous frame from the cache
+    PF_EffectWorld* prevW = NULL;
+    PF_Boolean hasPrev = FALSE;
+    AEGP_CCCheckoutReceiptP receipt = NULL;
+
+    A_long prevTime = o->time - o->timeStep;
+    if (prevTime >= 0 && o->depth < FB_MAX_DEPTH)
+    {
+        FBOptions prevO = *o;
+        prevO.time = prevTime;
+        prevO.depth = o->depth + 1;
+        A_Err cerr = cache->AEGP_ComputeIfNeededAndCheckout(kCacheClass, &prevO, true, &receipt);
+        if (cerr == A_Err_NONE && receipt)
+        {
+            FBFrameValue* prevV = NULL;
+            cache->AEGP_GetReceiptComputeValue(receipt, (AEGP_CCComputeValueRefconP*)&prevV);
+            if (prevV && prevV->world && prevV->world->width == w && prevV->world->height == h)
+            {
+                prevW = prevV->world;
+                hasPrev = TRUE;
+            }
+        }
+    }
+
+    // composite into a fresh world (struct is ours; AE owns the pixels until we dispose)
+    PF_EffectWorld* outW = (PF_EffectWorld*)malloc(sizeof(PF_EffectWorld));
+    if (!outW)
+    {
+        if (receipt) cache->AEGP_CheckinComputeReceipt(receipt);
+        (in_dataP->inter.checkin_param)(in_dataP->effect_ref, &cur_def);
+        return PF_Err_OUT_OF_MEMORY;
+    }
+    ERR(ws->PF_NewWorld(in_dataP->effect_ref, w, h, FALSE, PF_PixelFormat_ARGB128, outW));
+    if (!err)
+    {
+        CompositeFrame(curW, curFmt, prevW, hasPrev, outW, &o->params);
+    }
+
+    if (receipt) cache->AEGP_CheckinComputeReceipt(receipt);
+    (in_dataP->inter.checkin_param)(in_dataP->effect_ref, &cur_def);
+
+    if (!err && outW)
+    {
+        *outWorldPP = outW;
+        return PF_Err_NONE;
+    }
+    if (outW) ws->PF_DisposeWorld(in_dataP->effect_ref, outW);
+    return err ? err : PF_Err_INTERNAL_STRUCT_DAMAGED;
 }
 
 // ---------------------------------------------------------------- effect commands
@@ -66,18 +341,54 @@ static PF_Err GlobalSetup(PF_InData* in_dataP, PF_OutData* out_data, PF_ParamDef
     PF_Err err = PF_Err_NONE;
 
     out_data->my_version = PF_VERSION(MAJOR_VERSION, MINOR_VERSION, BUG_VERSION, STAGE_VERSION, BUILD_VERSION);
-
-    // temporal => NOT pix-independent; output varies with time even at constant params
     out_data->out_flags = PF_OutFlag_NON_PARAM_VARY | PF_OutFlag_DEEP_COLOR_AWARE;
+    out_data->out_flags2 = PF_OutFlag2_FLOAT_COLOR_AWARE | PF_OutFlag2_SUPPORTS_SMART_RENDER;
 
-    // no THREADED_RENDERING on purpose: the accumulator is serial state
-    out_data->out_flags2 = PF_OutFlag2_FLOAT_COLOR_AWARE | PF_OutFlag2_SUPPORTS_SMART_RENDER |
-                           PF_OutFlag2_MUTABLE_RENDER_SEQUENCE_DATA_SLOWER;
-
-    if (in_dataP->appl_id != 'PrMr')
+    // global data: the reset generation counter
+    AEFX_SuiteScoper<PF_HandleSuite1> hs =
+        AEFX_SuiteScoper<PF_HandleSuite1>(in_dataP, kPFHandleSuite, kPFHandleSuiteVersion1, out_data);
+    PF_Handle gh = hs->host_new_handle(sizeof(FBGlobal));
+    if (gh)
     {
-        out_data->out_flags2 |= PF_OutFlag2_SUPPORTS_GPU_RENDER_F32 | PF_OutFlag2_SUPPORTS_DIRECTX_RENDERING;
+        FBGlobal* g = (FBGlobal*)hs->host_lock_handle(gh);
+        g->generation = 0;
+        hs->host_unlock_handle(gh);
+        out_data->global_data = gh;
     }
+    else
+    {
+        err = PF_Err_OUT_OF_MEMORY;
+    }
+
+    // register the frame cache
+    if (!err)
+    {
+        AEFX_SuiteScoper<AEGP_ComputeCacheSuite1> cache =
+            AEFX_SuiteScoper<AEGP_ComputeCacheSuite1>(in_dataP, kAEGPComputeCacheSuite, kAEGPComputeCacheSuiteVersion1, out_data);
+        AEGP_ComputeCacheCallbacks cb;
+        cb.generate_key = FBGenerateKey;
+        cb.compute = FBCompute;
+        cb.approx_size_value = FBApproxSize;
+        cb.delete_compute_value = FBDeleteValue;
+        A_Err rerr = cache->AEGP_ClassRegister(kCacheClass, &cb);
+        if (rerr != A_Err_NONE) err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+    return err;
+}
+
+static PF_Err GlobalSetdown(PF_InData* in_dataP, PF_OutData* out_data)
+{
+    PF_Err err = PF_Err_NONE;
+    if (in_dataP->global_data)
+    {
+        AEFX_SuiteScoper<PF_HandleSuite1> hs =
+            AEFX_SuiteScoper<PF_HandleSuite1>(in_dataP, kPFHandleSuite, kPFHandleSuiteVersion1, out_data);
+        hs->host_dispose_handle(in_dataP->global_data);
+        in_dataP->global_data = NULL;
+    }
+    AEFX_SuiteScoper<AEGP_ComputeCacheSuite1> cache =
+        AEFX_SuiteScoper<AEGP_ComputeCacheSuite1>(in_dataP, kAEGPComputeCacheSuite, kAEGPComputeCacheSuiteVersion1, out_data);
+    cache->AEGP_ClassUnregister(kCacheClass);
     return err;
 }
 
@@ -112,347 +423,9 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     return err;
 }
 
-// ---------------------------------------------------------------- sequence data
-
-static PF_Err SequenceSetup(PF_InData* in_dataP, PF_OutData* out_dataP)
-{
-    PF_Err err = PF_Err_NONE;
-    if (!in_dataP->sequence_data)
-    {
-        AEFX_SuiteScoper<PF_HandleSuite1> handle_suite =
-            AEFX_SuiteScoper<PF_HandleSuite1>(in_dataP, kPFHandleSuite, kPFHandleSuiteVersion1, out_dataP);
-        PF_Handle h = handle_suite->host_new_handle(sizeof(FeedbackSeqData));
-        if (h)
-        {
-            FeedbackSeqData* sd = (FeedbackSeqData*)handle_suite->host_lock_handle(h);
-            memset(sd, 0, sizeof(FeedbackSeqData));
-            sd->deviceIndex = -1;
-            handle_suite->host_unlock_handle(h);
-            in_dataP->sequence_data = h;
-            out_dataP->out_flags |= PF_OutFlag_SEND_DO_DIALOG;   // not needed; keep flags minimal
-            out_dataP->out_flags &= ~PF_OutFlag_SEND_DO_DIALOG;
-        }
-        else
-        {
-            err = PF_Err_OUT_OF_MEMORY;
-        }
-    }
-    return err;
-}
-
-static PF_Err SequenceSetdown(PF_InData* in_dataP, PF_OutData* out_dataP)
-{
-    PF_Err err = PF_Err_NONE;
-    if (in_dataP->sequence_data)
-    {
-        AEFX_SuiteScoper<PF_HandleSuite1> handle_suite =
-            AEFX_SuiteScoper<PF_HandleSuite1>(in_dataP, kPFHandleSuite, kPFHandleSuiteVersion1, out_dataP);
-        FeedbackSeqData* sd = (FeedbackSeqData*)handle_suite->host_lock_handle(in_dataP->sequence_data);
-        if (sd->cpuPrevH) { handle_suite->host_dispose_handle(sd->cpuPrevH); sd->cpuPrevH = NULL; }
-        if (sd->gpuPrev[0] || sd->gpuPrev[1])
-        {
-            AEFX_SuiteScoper<PF_GPUDeviceSuite1> gpu_suite =
-                AEFX_SuiteScoper<PF_GPUDeviceSuite1>(in_dataP, kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1, out_dataP);
-            for (int k = 0; k < 2; k++)
-            {
-                if (sd->gpuPrev[k]) { gpu_suite->DisposeGPUWorld(in_dataP->effect_ref, sd->gpuPrev[k]); sd->gpuPrev[k] = NULL; }
-            }
-        }
-        handle_suite->host_unlock_handle(in_dataP->sequence_data);
-        handle_suite->host_dispose_handle(in_dataP->sequence_data);
-        in_dataP->sequence_data = NULL;
-    }
-    return err;
-}
-
-// continuity check: sequential forward render of identically-shaped frames?
-static PF_Boolean AccumulatorValid(FeedbackSeqData* sd, PF_InData* in_dataP, A_long w, A_long h)
-{
-    if (!sd->valid) return FALSE;
-    if (sd->width != w || sd->height != h) return FALSE;
-    if (sd->lastTime + sd->timeStep != in_dataP->current_time) return FALSE;
-    if (sd->timeStep != in_dataP->time_step) return FALSE;
-    return TRUE;
-}
-
-static void MarkRendered(FeedbackSeqData* sd, PF_InData* in_dataP, A_long w, A_long h)
-{
-    sd->valid = TRUE;
-    sd->lastTime = in_dataP->current_time;
-    sd->timeStep = in_dataP->time_step;
-    sd->width = w;
-    sd->height = h;
-}
-
-// ---------------------------------------------------------------- GPU (DirectX 12)
-
-#ifdef AE_OS_WIN
-
-struct FeedbackGPUData
-{
-    DXContextPtr    mContext;
-    ShaderObjectPtr mFeedbackShader;
-};
-
-static PF_Err GPUDeviceSetup(PF_InData* in_dataP, PF_OutData* out_dataP, PF_GPUDeviceSetupExtra* extraP)
-{
-    PF_Err err = PF_Err_NONE;
-    if (extraP->input->what_gpu != PF_GPU_Framework_DIRECTX) return PF_Err_UNRECOGNIZED_PARAM_TYPE;
-
-    AEFX_SuiteScoper<PF_HandleSuite1> handle_suite =
-        AEFX_SuiteScoper<PF_HandleSuite1>(in_dataP, kPFHandleSuite, kPFHandleSuiteVersion1, out_dataP);
-    AEFX_SuiteScoper<PF_GPUDeviceSuite1> gpuDeviceSuite =
-        AEFX_SuiteScoper<PF_GPUDeviceSuite1>(in_dataP, kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1, out_dataP);
-
-    PF_GPUDeviceInfo device_info;
-    AEFX_CLR_STRUCT(device_info);
-    gpuDeviceSuite->GetDeviceInfo(in_dataP->effect_ref, extraP->input->device_index, &device_info);
-
-    PF_Handle gpu_dataH = handle_suite->host_new_handle(sizeof(FeedbackGPUData));
-    FeedbackGPUData* dx = reinterpret_cast<FeedbackGPUData*>(*gpu_dataH);
-    memset(dx, 0, sizeof(FeedbackGPUData));
-
-    dx->mContext = std::make_shared<DXContext>();
-    dx->mFeedbackShader = std::make_shared<ShaderObject>();
-
-    DX_ERR(dx->mContext->Initialize((ID3D12Device*)device_info.devicePV, (ID3D12CommandQueue*)device_info.command_queuePV));
-
-    std::wstring csoPath, sigPath;
-    DX_ERR(GetShaderPath(L"FeedbackKernel", csoPath, sigPath));
-    DX_ERR(dx->mContext->LoadShader(csoPath.c_str(), sigPath.c_str(), dx->mFeedbackShader));
-
-    extraP->output->gpu_data = gpu_dataH;
-    out_dataP->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
-    return err;
-}
-
-static PF_Err GPUDeviceSetdown(PF_InData* in_dataP, PF_OutData* out_dataP, PF_GPUDeviceSetdownExtra* extraP)
-{
-    PF_Err err = PF_Err_NONE;
-    if (extraP->input->what_gpu == PF_GPU_Framework_DIRECTX)
-    {
-        PF_Handle gpu_dataH = (PF_Handle)extraP->input->gpu_data;
-        FeedbackGPUData* dx = reinterpret_cast<FeedbackGPUData*>(*gpu_dataH);
-        if (dx)
-        {
-            dx->mContext->CloseWaitAndReset();
-            dx->mContext.reset();
-            dx->mFeedbackShader.reset();
-        }
-        AEFX_SuiteScoper<PF_HandleSuite1> handle_suite =
-            AEFX_SuiteScoper<PF_HandleSuite1>(in_dataP, kPFHandleSuite, kPFHandleSuiteVersion1, out_dataP);
-        handle_suite->host_dispose_handle(gpu_dataH);
-    }
-    return err;
-}
-
-// ensure the two GPU accumulator worlds exist and match the current shape/device
-static PF_Err EnsureGpuAccumulator(
-    PF_InData* in_dataP,
-    PF_OutData* out_dataP,
-    FeedbackSeqData* sd,
-    A_long device_index,
-    A_long w, A_long h,
-    PF_PixelFormat fmt)
-{
-    PF_Err err = PF_Err_NONE;
-
-    if (sd->onGpu && sd->deviceIndex == device_index && sd->width == w && sd->height == h &&
-        sd->gpuPrev[0] && sd->gpuPrev[1])
-    {
-        return err; // reuse
-    }
-
-    AEFX_SuiteScoper<PF_GPUDeviceSuite1> gpu_suite =
-        AEFX_SuiteScoper<PF_GPUDeviceSuite1>(in_dataP, kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1, out_dataP);
-
-    // free any stale accumulator
-    for (int k = 0; k < 2; k++)
-    {
-        if (sd->gpuPrev[k]) { gpu_suite->DisposeGPUWorld(in_dataP->effect_ref, sd->gpuPrev[k]); sd->gpuPrev[k] = NULL; }
-    }
-    if (sd->cpuPrevH)
-    {
-        AEFX_SuiteScoper<PF_HandleSuite1> hs =
-            AEFX_SuiteScoper<PF_HandleSuite1>(in_dataP, kPFHandleSuite, kPFHandleSuiteVersion1, out_dataP);
-        hs->host_dispose_handle(sd->cpuPrevH);
-        sd->cpuPrevH = NULL;
-    }
-
-    for (int k = 0; k < 2 && !err; k++)
-    {
-        ERR(gpu_suite->CreateGPUWorld(
-            in_dataP->effect_ref, device_index, w, h, in_dataP->pixel_aspect_ratio, in_dataP->field, fmt, false,
-            &sd->gpuPrev[k]));
-    }
-    sd->gpuCur = 0;
-    sd->onGpu = TRUE;
-    sd->deviceIndex = device_index;
-    sd->valid = FALSE;   // fresh accumulator has no history
-    return err;
-}
-
-#endif // AE_OS_WIN
-
-// ---------------------------------------------------------------- CPU path
-
-// convert any depth pixel row to float RGBA
-static inline void ToFloat8(const PF_Pixel8* p, float* r, float* g, float* b, float* a)
-{ *r = p->red / 255.f; *g = p->green / 255.f; *b = p->blue / 255.f; *a = p->alpha / 255.f; }
-static inline void ToFloat16(const PF_Pixel16* p, float* r, float* g, float* b, float* a)
-{ *r = p->red / 32768.f; *g = p->green / 32768.f; *b = p->blue / 32768.f; *a = p->alpha / 32768.f; }
-static inline void ToFloat32(const PF_PixelFloat* p, float* r, float* g, float* b, float* a)
-{ *r = p->red; *g = p->green; *b = p->blue; *a = p->alpha; }
-
-// CPU accumulator stores float RGBA tightly packed
-static float* CpuPrevPixel(FeedbackSeqData* sd, A_long x, A_long y)
-{
-    float* base = (float*)(*(sd->cpuPrevH));
-    return base + ((size_t)y * (size_t)sd->width + (size_t)x) * 4;
-}
-
-static PF_Err FeedbackCPU(
-    PF_InData* in_data,
-    PF_OutData* out_data,
-    PF_PixelFormat pixel_format,
-    PF_EffectWorld* input_worldP,
-    PF_EffectWorld* output_worldP,
-    FeedbackSeqData* sd,
-    float decay, float zoomPct, float rotDeg, float offX, float offY)
-{
-    PF_Err err = PF_Err_NONE;
-    A_long w = output_worldP->width, h = output_worldP->height;
-
-    AEFX_SuiteScoper<PF_HandleSuite1> hs =
-        AEFX_SuiteScoper<PF_HandleSuite1>(in_data, kPFHandleSuite, kPFHandleSuiteVersion1, out_data);
-
-    // (re)allocate the accumulator if needed
-    size_t needBytes = (size_t)w * (size_t)h * 4 * sizeof(float);
-    if (!sd->cpuPrevH || sd->width != w || sd->height != h || sd->onGpu)
-    {
-        if (sd->cpuPrevH) { hs->host_dispose_handle(sd->cpuPrevH); sd->cpuPrevH = NULL; }
-        sd->cpuPrevH = hs->host_new_handle(needBytes);
-        if (!sd->cpuPrevH) return PF_Err_OUT_OF_MEMORY;
-        sd->valid = FALSE;
-        sd->onGpu = FALSE;
-        sd->deviceIndex = -1;
-    }
-
-    PF_Boolean hasPrev = AccumulatorValid(sd, in_data, w, h);
-
-    float m00, m01, m02, m10, m11, m12;
-    BuildInverseTransform(w * 0.5f, h * 0.5f, offX, offY, rotDeg, zoomPct, &m00, &m01, &m02, &m10, &m11, &m12);
-
-    for (A_long y = 0; y < h && !err; y++)
-    {
-        for (A_long x = 0; x < w; x++)
-        {
-            float r, g, b, a;
-            A_long srcOff = y * input_worldP->rowbytes;
-            A_long dstOff = y * output_worldP->rowbytes;
-            switch (pixel_format)
-            {
-            case PF_PixelFormat_ARGB32:
-                ToFloat8((PF_Pixel8*)((char*)input_worldP->data + srcOff) + x, &r, &g, &b, &a);
-                break;
-            case PF_PixelFormat_ARGB64:
-                ToFloat16((PF_Pixel16*)((char*)input_worldP->data + srcOff) + x, &r, &g, &b, &a);
-                break;
-            case PF_PixelFormat_ARGB128:
-                ToFloat32((PF_PixelFloat*)((char*)input_worldP->data + srcOff) + x, &r, &g, &b, &a);
-                break;
-            default:
-                return PF_Err_BAD_CALLBACK_PARAM;
-            }
-
-            float or_ = r, og = g, ob = b, oa = a;
-            if (hasPrev)
-            {
-                float fx = (float)x + 0.5f, fy = (float)y + 0.5f;
-                float px = m00 * fx + m01 * fy + m02 - 0.5f;
-                float py = m10 * fx + m11 * fy + m12 - 0.5f;
-                int x0 = (int)floorf(px), y0 = (int)floorf(py);
-                float tx = px - (float)x0, ty = py - (float)y0;
-                int x1 = x0 + 1, y1 = y0 + 1;
-                if (x0 < 0) x0 = 0; if (x0 > w - 1) x0 = w - 1;
-                if (x1 < 0) x1 = 0; if (x1 > w - 1) x1 = w - 1;
-                if (y0 < 0) y0 = 0; if (y0 > h - 1) y0 = h - 1;
-                if (y1 < 0) y1 = 0; if (y1 > h - 1) y1 = h - 1;
-
-                float* c00 = CpuPrevPixel(sd, x0, y0);
-                float* c10 = CpuPrevPixel(sd, x1, y0);
-                float* c01 = CpuPrevPixel(sd, x0, y1);
-                float* c11 = CpuPrevPixel(sd, x1, y1);
-                float pr = (c00[0] + (c10[0] - c00[0]) * tx);
-                float pg = (c00[1] + (c10[1] - c00[1]) * tx);
-                float pb = (c00[2] + (c10[2] - c00[2]) * tx);
-                float pa = (c00[3] + (c10[3] - c00[3]) * tx);
-                float qr = (c01[0] + (c11[0] - c01[0]) * tx);
-                float qg = (c01[1] + (c11[1] - c01[1]) * tx);
-                float qb = (c01[2] + (c11[2] - c01[2]) * tx);
-                float qa = (c01[3] + (c11[3] - c01[3]) * tx);
-                float vr = (pr + (qr - pr) * ty) * decay;
-                float vg = (pg + (qg - pg) * ty) * decay;
-                float vb = (pb + (qb - pb) * ty) * decay;
-                float va = (pa + (qa - pa) * ty) * decay;
-
-                // premultiplied over: current over decayed previous
-                or_ = r + vr * (1.f - a);
-                og = g + vg * (1.f - a);
-                ob = b + vb * (1.f - a);
-                oa = a + va * (1.f - a);
-            }
-
-            // write visible output
-            switch (pixel_format)
-            {
-            case PF_PixelFormat_ARGB32: {
-                PF_Pixel8* d = (PF_Pixel8*)((char*)output_worldP->data + dstOff) + x;
-                d->red = (A_u_char)(Clamp01(or_) * 255.f + 0.5f);
-                d->green = (A_u_char)(Clamp01(og) * 255.f + 0.5f);
-                d->blue = (A_u_char)(Clamp01(ob) * 255.f + 0.5f);
-                d->alpha = (A_u_char)(Clamp01(oa) * 255.f + 0.5f);
-                break;
-            }
-            case PF_PixelFormat_ARGB64: {
-                PF_Pixel16* d = (PF_Pixel16*)((char*)output_worldP->data + dstOff) + x;
-                d->red = (A_u_short)(Clamp01(or_) * 32768.f);
-                d->green = (A_u_short)(Clamp01(og) * 32768.f);
-                d->blue = (A_u_short)(Clamp01(ob) * 32768.f);
-                d->alpha = (A_u_short)(Clamp01(oa) * 32768.f);
-                break;
-            }
-            case PF_PixelFormat_ARGB128: {
-                PF_PixelFloat* d = (PF_PixelFloat*)((char*)output_worldP->data + dstOff) + x;
-                d->red = or_; d->green = og; d->blue = ob; d->alpha = oa;
-                break;
-            }
-            }
-
-            // write the new accumulator (float RGBA)
-            float* np = CpuPrevPixel(sd, x, y);
-            np[0] = or_; np[1] = og; np[2] = ob; np[3] = oa;
-        }
-    }
-
-    MarkRendered(sd, in_data, w, h);
-    return err;
-}
-
-// ---------------------------------------------------------------- render plumbing
-
-typedef struct
-{
-    float mDecay;
-    float mZoom;
-    float mRotate;
-    float mOffX;
-    float mOffY;
-} FeedbackUserParams;
-
 static PF_Err Render(PF_InData* in_dataP, PF_OutData* out_dataP, PF_ParamDef* params[], PF_LayerDef* output)
 {
-    // legacy non-smart path: no feedback state, just pass the input through
+    // legacy non-smart path: passthrough
     PF_Err err = PF_Err_NONE;
     AEFX_SuiteScoper<PF_WorldTransformSuite1> wtP = AEFX_SuiteScoper<PF_WorldTransformSuite1>(
         in_dataP, kPFWorldTransformSuite, kPFWorldTransformSuiteVersion1, out_dataP);
@@ -464,55 +437,53 @@ static PF_Err PreRender(PF_InData* in_dataP, PF_OutData* out_dataP, PF_PreRender
 {
     PF_Err err = PF_Err_NONE;
 
-    extraP->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
+    // no GPU_RENDER_POSSIBLE on v1.1: cache values are CPU worlds (see header comment)
 
-    // AE requires result_rect + max_result_rect to be initialized at SMART_PRE_RENDER
-    {
-        PF_RenderRequest req = extraP->input->output_request;
-        PF_CheckoutResult in_result;
-        AEFX_CLR_STRUCT(in_result);
-        ERR(extraP->cb->checkout_layer(in_dataP->effect_ref, FB_INPUT, FB_INPUT, &req,
-                                       in_dataP->current_time, in_dataP->time_step, in_dataP->time_scale, &in_result));
-        if (!err)
-        {
-            UnionLRect(&in_result.result_rect, &extraP->output->result_rect);
-            UnionLRect(&in_result.max_result_rect, &extraP->output->max_result_rect);
-        }
-    }
-
-    FeedbackUserParams* infoP = (FeedbackUserParams*)malloc(sizeof(FeedbackUserParams));
-    if (!infoP) return PF_Err_OUT_OF_MEMORY;
+    FeedbackUserParams* up = (FeedbackUserParams*)malloc(sizeof(FeedbackUserParams));
+    if (!up) return PF_Err_OUT_OF_MEMORY;
 
     PF_ParamDef cur_param;
 
     ERR(PF_CHECKOUT_PARAM(in_dataP, FB_DECAY, in_dataP->current_time, in_dataP->time_step,
                           in_dataP->time_scale, &cur_param));
-    if (!err) infoP->mDecay = (float)(cur_param.u.fs_d.value / 100.0);
+    if (!err) up->mDecay = (float)(cur_param.u.fs_d.value / 100.0);
 
     ERR(PF_CHECKOUT_PARAM(in_dataP, FB_ZOOM, in_dataP->current_time, in_dataP->time_step,
                           in_dataP->time_scale, &cur_param));
-    if (!err) infoP->mZoom = (float)cur_param.u.fs_d.value;
+    if (!err) up->mZoom = (float)cur_param.u.fs_d.value;
 
     ERR(PF_CHECKOUT_PARAM(in_dataP, FB_ROTATE, in_dataP->current_time, in_dataP->time_step,
                           in_dataP->time_scale, &cur_param));
-    if (!err) infoP->mRotate = (float)(cur_param.u.ad.value / 65536.0);
+    if (!err) up->mRotate = (float)(cur_param.u.ad.value / 65536.0);
 
     ERR(PF_CHECKOUT_PARAM(in_dataP, FB_OFFSET_X, in_dataP->current_time, in_dataP->time_step,
                           in_dataP->time_scale, &cur_param));
-    if (!err) infoP->mOffX = (float)cur_param.u.fs_d.value;
+    if (!err) up->mOffX = (float)cur_param.u.fs_d.value;
 
     ERR(PF_CHECKOUT_PARAM(in_dataP, FB_OFFSET_Y, in_dataP->current_time, in_dataP->time_step,
                           in_dataP->time_scale, &cur_param));
-    if (!err) infoP->mOffY = (float)cur_param.u.fs_d.value;
+    if (!err) up->mOffY = (float)cur_param.u.fs_d.value;
 
-    if (err) { free(infoP); return err; }
+    if (err) { free(up); return err; }
 
-    extraP->output->pre_render_data = infoP;
+    extraP->output->pre_render_data = up;
     extraP->output->delete_pre_render_data_func = [](void* p) { free(p); };
+
+    // AE requires these at SMART_PRE_RENDER
+    PF_RenderRequest req = extraP->input->output_request;
+    PF_CheckoutResult in_result;
+    AEFX_CLR_STRUCT(in_result);
+    ERR(extraP->cb->checkout_layer(in_dataP->effect_ref, FB_INPUT, FB_INPUT, &req,
+                                   in_dataP->current_time, in_dataP->time_step, in_dataP->time_scale, &in_result));
+    if (!err)
+    {
+        UnionLRect(&in_result.result_rect, &extraP->output->result_rect);
+        UnionLRect(&in_result.max_result_rect, &extraP->output->max_result_rect);
+    }
     return err;
 }
 
-static PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* extraP, bool isGPU)
+static PF_Err SmartRender(PF_InData* in_dataP, PF_OutData* out_dataP, PF_SmartRenderExtra* extraP, bool isGPU)
 {
     PF_Err err = PF_Err_NONE;
     PF_Err err2 = PF_Err_NONE;
@@ -521,118 +492,116 @@ static PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRend
     if (!up) return PF_Err_INTERNAL_STRUCT_DAMAGED;
 
     AEFX_SuiteScoper<PF_HandleSuite1> hs =
-        AEFX_SuiteScoper<PF_HandleSuite1>(in_data, kPFHandleSuite, kPFHandleSuiteVersion1, out_data);
-    AEFX_SuiteScoper<PF_WorldSuite2> world_suite =
-        AEFX_SuiteScoper<PF_WorldSuite2>(in_data, kPFWorldSuite, kPFWorldSuiteVersion2, out_data);
+        AEFX_SuiteScoper<PF_HandleSuite1>(in_dataP, kPFHandleSuite, kPFHandleSuiteVersion1, out_dataP);
+    AEFX_SuiteScoper<PF_WorldSuite2> ws =
+        AEFX_SuiteScoper<PF_WorldSuite2>(in_dataP, kPFWorldSuite, kPFWorldSuiteVersion2, out_dataP);
+    AEFX_SuiteScoper<AEGP_ComputeCacheSuite1> cache =
+        AEFX_SuiteScoper<AEGP_ComputeCacheSuite1>(in_dataP, kAEGPComputeCacheSuite, kAEGPComputeCacheSuiteVersion1, out_dataP);
+    AEFX_SuiteScoper<PF_ParamUtilsSuite3> paramUtils =
+        AEFX_SuiteScoper<PF_ParamUtilsSuite3>(in_dataP, kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, out_dataP);
 
-    if (!in_data->sequence_data) { ERR(SequenceSetup(in_data, out_data)); }
-    if (!in_data->sequence_data) return PF_Err_INTERNAL_STRUCT_DAMAGED;
-
-    FeedbackSeqData* sd = (FeedbackSeqData*)hs->host_lock_handle(in_data->sequence_data);
-
-    PF_EffectWorld* input_worldP = NULL;
     PF_EffectWorld* output_worldP = NULL;
+    ERR(extraP->cb->checkout_output(in_dataP->effect_ref, &output_worldP));
+    if (err || !output_worldP) return err ? err : PF_Err_INTERNAL_STRUCT_DAMAGED;
 
-    ERR(extraP->cb->checkout_layer_pixels(in_data->effect_ref, FB_INPUT, &input_worldP));
-    ERR(extraP->cb->checkout_output(in_data->effect_ref, &output_worldP));
+    // build the frame options
+    FBOptions o;
+    memset(&o, 0, sizeof(o));
+    o.in_dataP = in_dataP;
+    o.time = in_dataP->current_time;
+    o.timeStep = in_dataP->time_step;
+    o.timeScale = in_dataP->time_scale;
+    o.params = *up;
+    o.depth = 0;
 
-    if (!err && input_worldP && output_worldP)
+    if (in_dataP->global_data)
     {
-        PF_PixelFormat pixel_format = PF_PixelFormat_INVALID;
-        ERR(world_suite->PF_GetPixelFormat(input_worldP, &pixel_format));
+        FBGlobal* g = (FBGlobal*)hs->host_lock_handle(in_dataP->global_data);
+        o.generation = g->generation;
+        hs->host_unlock_handle(in_dataP->global_data);
+    }
 
-#ifdef AE_OS_WIN
-        if (isGPU)
+    ERR(paramUtils->PF_GetCurrentState(in_dataP->effect_ref, FB_INPUT, NULL, NULL, &o.inputState));
+
+    if (!err)
+    {
+        AEGP_CCCheckoutReceiptP receipt = NULL;
+        A_Err cerr = cache->AEGP_ComputeIfNeededAndCheckout(kCacheClass, &o, true, &receipt);
+        if (cerr == A_Err_NONE && receipt)
         {
-            err = PF_Err_UNRECOGNIZED_PARAM_TYPE;
-            if (pixel_format == PF_PixelFormat_GPU_BGRA128)
+            FBFrameValue* v = NULL;
+            cache->AEGP_GetReceiptComputeValue(receipt, (AEGP_CCComputeValueRefconP*)&v);
+            if (v && v->world)
             {
-                AEFX_SuiteScoper<PF_GPUDeviceSuite1> gpu_suite = AEFX_SuiteScoper<PF_GPUDeviceSuite1>(
-                    in_data, kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1, out_data);
-
-                err = EnsureGpuAccumulator(
-                    in_data, out_data, sd, extraP->input->device_index,
-                    input_worldP->width, input_worldP->height, pixel_format);
-
-                PF_Boolean hasPrev = FALSE;
-                if (!err) hasPrev = AccumulatorValid(sd, in_data, input_worldP->width, input_worldP->height);
-
-                if (!err)
+                // blit the cached 32f frame into the output world (any depth)
+                PF_PixelFormat outFmt = PF_PixelFormat_INVALID;
+                ERR(ws->PF_GetPixelFormat(output_worldP, &outFmt));
+                A_long w = v->world->width < output_worldP->width ? v->world->width : output_worldP->width;
+                A_long h = v->world->height < output_worldP->height ? v->world->height : output_worldP->height;
+                for (A_long y = 0; y < h && !err; y++)
                 {
-                    PF_Handle gpu_dataH = (PF_Handle)extraP->input->gpu_data;
-                    FeedbackGPUData* dx = reinterpret_cast<FeedbackGPUData*>(*gpu_dataH);
-
-                    FeedbackParams kp;
-                    A_long bpp = 16;
-                    kp.mSrcPitch = input_worldP->rowbytes / bpp;
-                    kp.mDstPitch = output_worldP->rowbytes / bpp;
-                    kp.mPrevReadPitch = sd->gpuPrev[sd->gpuCur]->rowbytes / bpp;
-                    kp.mPrevWritePitch = sd->gpuPrev[1 - sd->gpuCur]->rowbytes / bpp;
-                    kp.mWidth = input_worldP->width;
-                    kp.mHeight = input_worldP->height;
-                    kp.mDecay = up->mDecay;
-                    kp.mHasPrev = hasPrev ? 1 : 0;
-                    BuildInverseTransform(
-                        kp.mWidth * 0.5f, kp.mHeight * 0.5f, up->mOffX, up->mOffY, up->mRotate, up->mZoom,
-                        &kp.mM00, &kp.mM01, &kp.mM02, &kp.mM10, &kp.mM11, &kp.mM12);
-
-                    void* src_mem = 0; void* dst_mem = 0;
-                    void* prev_r = 0; void* prev_w = 0;
-                    ERR(gpu_suite->GetGPUWorldData(in_data->effect_ref, input_worldP, &src_mem));
-                    ERR(gpu_suite->GetGPUWorldData(in_data->effect_ref, output_worldP, &dst_mem));
-                    ERR(gpu_suite->GetGPUWorldData(in_data->effect_ref, sd->gpuPrev[sd->gpuCur], &prev_r));
-                    ERR(gpu_suite->GetGPUWorldData(in_data->effect_ref, sd->gpuPrev[1 - sd->gpuCur], &prev_w));
-
-                    if (!err)
+                    const PF_PixelFloat* srcRow =
+                        (const PF_PixelFloat*)((const char*)v->world->data + (size_t)y * (size_t)v->world->rowbytes);
+                    char* dstRow = (char*)output_worldP->data + (size_t)y * (size_t)output_worldP->rowbytes;
+                    for (A_long x = 0; x < w; x++)
                     {
-                        DXShaderExecution shaderExecution(dx->mContext, dx->mFeedbackShader, 5);
-                        DX_ERR(shaderExecution.SetParamBuffer(&kp, sizeof(FeedbackParams)));
-                        DX_ERR(shaderExecution.SetUnorderedAccessView((ID3D12Resource*)dst_mem, kp.mHeight * output_worldP->rowbytes));
-                        DX_ERR(shaderExecution.SetUnorderedAccessView((ID3D12Resource*)prev_w, kp.mHeight * sd->gpuPrev[1 - sd->gpuCur]->rowbytes));
-                        DX_ERR(shaderExecution.SetShaderResourceView((ID3D12Resource*)src_mem, kp.mHeight * input_worldP->rowbytes));
-                        DX_ERR(shaderExecution.SetShaderResourceView((ID3D12Resource*)prev_r, kp.mHeight * sd->gpuPrev[sd->gpuCur]->rowbytes));
-                        DX_ERR(shaderExecution.Execute((UINT)((kp.mWidth + 15) / 16), (UINT)((kp.mHeight + 15) / 16)));
-                    }
-
-                    if (!err)
-                    {
-                        sd->gpuCur = 1 - sd->gpuCur;   // ping-pong
-                        MarkRendered(sd, in_data, kp.mWidth, kp.mHeight);
+                        const PF_PixelFloat* s = srcRow + x;
+                        switch (outFmt)
+                        {
+                        case PF_PixelFormat_ARGB32: {
+                            PF_Pixel8* d = ((PF_Pixel8*)dstRow) + x;
+                            d->red = (A_u_char)(Clamp01(s->red) * 255.f + 0.5f);
+                            d->green = (A_u_char)(Clamp01(s->green) * 255.f + 0.5f);
+                            d->blue = (A_u_char)(Clamp01(s->blue) * 255.f + 0.5f);
+                            d->alpha = (A_u_char)(Clamp01(s->alpha) * 255.f + 0.5f);
+                            break;
+                        }
+                        case PF_PixelFormat_ARGB64: {
+                            PF_Pixel16* d = ((PF_Pixel16*)dstRow) + x;
+                            d->red = (A_u_short)(Clamp01(s->red) * 32768.f);
+                            d->green = (A_u_short)(Clamp01(s->green) * 32768.f);
+                            d->blue = (A_u_short)(Clamp01(s->blue) * 32768.f);
+                            d->alpha = (A_u_short)(Clamp01(s->alpha) * 32768.f);
+                            break;
+                        }
+                        case PF_PixelFormat_ARGB128: {
+                            PF_PixelFloat* d = ((PF_PixelFloat*)dstRow) + x;
+                            *d = *s;
+                            break;
+                        }
+                        default:
+                            err = PF_Err_BAD_CALLBACK_PARAM;
+                            break;
+                        }
                     }
                 }
             }
+            cache->AEGP_CheckinComputeReceipt(receipt);
         }
-        else
-#endif
+        else if (!err)
         {
-            ERR(FeedbackCPU(in_data, out_data, pixel_format, input_worldP, output_worldP, sd,
-                            up->mDecay, up->mZoom, up->mRotate, up->mOffX, up->mOffY));
+            err = PF_Err_INTERNAL_STRUCT_DAMAGED;
         }
     }
 
-    hs->host_unlock_handle(in_data->sequence_data);
-
-    if (input_worldP)
+    if (output_worldP)
     {
-        err2 = extraP->cb->checkin_layer_pixels(in_data->effect_ref, FB_INPUT);
+        err2 = PF_Err_NONE; // output world needs no checkin
     }
     if (!err) err = err2;
     return err;
 }
 
-// ---------------------------------------------------------------- events (Reset button)
-
 static PF_Err UserChangedParam(PF_InData* in_dataP, PF_OutData* out_dataP, const PF_UserChangedParamExtra* extraP)
 {
     PF_Err err = PF_Err_NONE;
-    if (extraP->param_index == FB_RESET && in_dataP->sequence_data)
+    if (extraP->param_index == FB_RESET && in_dataP->global_data)
     {
         AEFX_SuiteScoper<PF_HandleSuite1> hs =
             AEFX_SuiteScoper<PF_HandleSuite1>(in_dataP, kPFHandleSuite, kPFHandleSuiteVersion1, out_dataP);
-        FeedbackSeqData* sd = (FeedbackSeqData*)hs->host_lock_handle(in_dataP->sequence_data);
-        sd->valid = FALSE;
-        sd->lastTime = 0;
-        hs->host_unlock_handle(in_dataP->sequence_data);
+        FBGlobal* g = (FBGlobal*)hs->host_lock_handle(in_dataP->global_data);
+        g->generation++;
+        hs->host_unlock_handle(in_dataP->global_data);
         out_dataP->out_flags |= PF_OutFlag_FORCE_RERENDER;
     }
     return err;
@@ -660,18 +629,14 @@ PF_Err EffectMain(
         case PF_Cmd_GLOBAL_SETUP:
             err = GlobalSetup(in_dataP, out_data, params, output);
             break;
+        case PF_Cmd_GLOBAL_SETDOWN:
+            err = GlobalSetdown(in_dataP, out_data);
+            break;
         case PF_Cmd_PARAMS_SETUP:
             err = ParamsSetup(in_dataP, out_data, params, output);
             break;
         case PF_Cmd_RENDER:
             err = Render(in_dataP, out_data, params, output);
-            break;
-        case PF_Cmd_SEQUENCE_SETUP:
-        case PF_Cmd_SEQUENCE_RESETUP:
-            err = SequenceSetup(in_dataP, out_data);
-            break;
-        case PF_Cmd_SEQUENCE_SETDOWN:
-            err = SequenceSetdown(in_dataP, out_data);
             break;
         case PF_Cmd_USER_CHANGED_PARAM:
             err = UserChangedParam(in_dataP, out_data, (const PF_UserChangedParamExtra*)extra);
@@ -682,17 +647,6 @@ PF_Err EffectMain(
         case PF_Cmd_SMART_RENDER:
             err = SmartRender(in_dataP, out_data, (PF_SmartRenderExtra*)extra, false);
             break;
-        case PF_Cmd_SMART_RENDER_GPU:
-            err = SmartRender(in_dataP, out_data, (PF_SmartRenderExtra*)extra, true);
-            break;
-#ifdef AE_OS_WIN
-        case PF_Cmd_GPU_DEVICE_SETUP:
-            err = GPUDeviceSetup(in_dataP, out_data, (PF_GPUDeviceSetupExtra*)extra);
-            break;
-        case PF_Cmd_GPU_DEVICE_SETDOWN:
-            err = GPUDeviceSetdown(in_dataP, out_data, (PF_GPUDeviceSetdownExtra*)extra);
-            break;
-#endif
         default:
             break;
         }

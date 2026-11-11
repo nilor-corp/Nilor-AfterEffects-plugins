@@ -22,6 +22,11 @@
 
 // ---------------------------------------------------------------- helpers
 
+static const float kBayer2[4] = {
+     0,  2,
+     3,  1
+};
+
 static const float kBayer4[16] = {
      0,  8,  2, 10,
     12,  4, 14,  6,
@@ -46,7 +51,7 @@ static float BayerAt(int x, int y, int size, float phase)
     int shift = (int)(phase * (float)n2 * 1.61803398875f);
     int idx = ((y % size) * size + (x % size) + shift) % n2;
     if (idx < 0) idx += n2;
-    float v = (size == 4) ? kBayer4[idx] : kBayer8[idx];
+    float v = (size == 2) ? kBayer2[idx] : ((size == 4) ? kBayer4[idx] : kBayer8[idx]);
     return v / (float)n2;
 }
 
@@ -104,7 +109,7 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
         1, PF_ValueDisplayFlag_PERCENT, 0, DITHER_STRENGTH);
 
     AEFX_CLR_STRUCT(def);
-    PF_ADD_POPUP("Matrix", 2, 2, "4x4|8x8", DITHER_MATRIX);
+    PF_ADD_POPUP("Matrix", 3, 2, "2x2|4x4|8x8", DITHER_MATRIX);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Animated", FALSE, 0, DITHER_ANIMATED);
@@ -251,7 +256,7 @@ static PF_Err Render(PF_InData* in_dataP, PF_OutData* out_dataP, PF_ParamDef* pa
     p.mHeight = output->height;
     p.mLevels = (float)params[DITHER_LEVELS]->u.fs_d.value;
     p.mStrength = (float)(params[DITHER_STRENGTH]->u.fs_d.value / 100.0);
-    p.mMatrixSize = (params[DITHER_MATRIX]->u.pd.value == 1) ? 4 : 8;
+    p.mMatrixSize = (params[DITHER_MATRIX]->u.pd.value == 1) ? 2 : ((params[DITHER_MATRIX]->u.pd.value == 2) ? 4 : 8);
     p.mPhase = 0.0f;
     if (params[DITHER_ANIMATED]->u.bd.value)
     {
@@ -340,7 +345,7 @@ static PF_Err PreRender(PF_InData* in_dataP, PF_OutData* out_dataP, PF_PreRender
 
     ERR(PF_CHECKOUT_PARAM(in_dataP, DITHER_MATRIX, in_dataP->current_time, in_dataP->time_step,
                           in_dataP->time_scale, &cur_param));
-    if (!err) infoP->mMatrixSize = (cur_param.u.pd.value == 1) ? 4 : 8;
+    if (!err) infoP->mMatrixSize = (cur_param.u.pd.value == 1) ? 2 : ((cur_param.u.pd.value == 2) ? 4 : 8);
 
     ERR(PF_CHECKOUT_PARAM(in_dataP, DITHER_ANIMATED, in_dataP->current_time, in_dataP->time_step,
                           in_dataP->time_scale, &cur_param));
