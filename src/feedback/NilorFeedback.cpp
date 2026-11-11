@@ -31,6 +31,9 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread>
+#include <vector>
+#include <algorithm>
 
 // ---------------------------------------------------------------- params / state
 
@@ -56,10 +59,12 @@ typedef struct
     int              depth;       // recursion guard
 } FBOptions;
 
-// cached value: one composited frame as a 32f ARGB CPU world
+// cached value: one composited frame as a 16-bit ARGB CPU world (4x smaller than float;
+// a 70 s 4K sequence of float frames would be ~277 GB — the cache would purge and the chain
+// would recompute. 16-bit keeps it cacheable and trails don't need float precision.)
 typedef struct
 {
-    PF_EffectWorld* world;        // owned
+    PF_EffectWorld* world;        // owned (struct malloc'd by us; pixels owned by AE until dispose)
     const SPBasicSuite* pica;     // for disposal on purge (any thread)
     A_long width, height;
 } FBFrameValue;
@@ -133,21 +138,20 @@ static inline void ReadWorldPixel(const PF_EffectWorld* w, PF_PixelFormat fmt, A
 
 // ---------------------------------------------------------------- the composite
 
-// out = cur OVER (decay * transform(prev)), all float RGBA, premultiplied
-static void CompositeFrame(
+// one band of rows of the composite. out is ARGB64 (16-bit) — cached frames are 4x smaller
+// than float and trails don't need float precision.
+static void CompositeRows(
+    A_long y0, A_long y1,
     const PF_EffectWorld* curW, PF_PixelFormat curFmt,
     const PF_EffectWorld* prevW, PF_Boolean hasPrev,
     PF_EffectWorld* outW,
-    const FeedbackUserParams* up)
+    const FeedbackUserParams* up,
+    float m00, float m01, float m02, float m10, float m11, float m12)
 {
-    A_long w = outW->width, h = outW->height;
-    float m00, m01, m02, m10, m11, m12;
-    BuildInverseTransform(w * 0.5f, h * 0.5f, up->mOffX, up->mOffY, up->mRotate, up->mZoom,
-                          &m00, &m01, &m02, &m10, &m11, &m12);
-
-    for (A_long y = 0; y < h; y++)
+    A_long w = outW->width;
+    for (A_long y = y0; y < y1; y++)
     {
-        PF_PixelFloat* dst = (PF_PixelFloat*)((char*)outW->data + (size_t)y * (size_t)outW->rowbytes);
+        PF_Pixel16* dst = (PF_Pixel16*)((char*)outW->data + (size_t)y * (size_t)outW->rowbytes);
         for (A_long x = 0; x < w; x++, dst++)
         {
             float cur[4];
@@ -165,14 +169,15 @@ static void CompositeFrame(
                 int x1 = x0 + 1, y1 = y0 + 1;
                 if (x0 < 0) x0 = 0; if (x0 > w - 1) x0 = w - 1;
                 if (x1 < 0) x1 = 0; if (x1 > w - 1) x1 = w - 1;
+                A_long h = outW->height;
                 if (y0 < 0) y0 = 0; if (y0 > h - 1) y0 = h - 1;
                 if (y1 < 0) y1 = 0; if (y1 > h - 1) y1 = h - 1;
 
                 float c00[4], c10[4], c01[4], c11[4];
-                ReadWorldPixel(prevW, PF_PixelFormat_ARGB128, x0, y0, c00);
-                ReadWorldPixel(prevW, PF_PixelFormat_ARGB128, x1, y0, c10);
-                ReadWorldPixel(prevW, PF_PixelFormat_ARGB128, x0, y1, c01);
-                ReadWorldPixel(prevW, PF_PixelFormat_ARGB128, x1, y1, c11);
+                ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x0, y0, c00);
+                ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x1, y0, c10);
+                ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x0, y1, c01);
+                ReadWorldPixel(prevW, PF_PixelFormat_ARGB64, x1, y1, c11);
 
                 for (int c = 0; c < 4; c++)
                 {
@@ -188,9 +193,49 @@ static void CompositeFrame(
                 }
             }
 
-            dst->red = oR; dst->green = oG; dst->blue = oB; dst->alpha = oA;
+            dst->red   = (A_u_short)(Clamp01(oR) * 32768.f);
+            dst->green = (A_u_short)(Clamp01(oG) * 32768.f);
+            dst->blue  = (A_u_short)(Clamp01(oB) * 32768.f);
+            dst->alpha = (A_u_short)(Clamp01(oA) * 32768.f);
         }
     }
+}
+
+// out = cur OVER (decay * transform(prev)), row-parallel
+static void CompositeFrame(
+    const PF_EffectWorld* curW, PF_PixelFormat curFmt,
+    const PF_EffectWorld* prevW, PF_Boolean hasPrev,
+    PF_EffectWorld* outW,
+    const FeedbackUserParams* up)
+{
+    A_long w = outW->width, h = outW->height;
+    float m00, m01, m02, m10, m11, m12;
+    BuildInverseTransform(w * 0.5f, h * 0.5f, up->mOffX, up->mOffY, up->mRotate, up->mZoom,
+                          &m00, &m01, &m02, &m10, &m11, &m12);
+
+    unsigned nth = std::thread::hardware_concurrency();
+    if (nth == 0) nth = 4;
+    nth = std::min(nth, 16u);
+    if ((unsigned)h < nth * 64) nth = std::max(1u, (unsigned)(h / 64));
+
+    if (nth <= 1)
+    {
+        CompositeRows(0, h, curW, curFmt, prevW, hasPrev, outW, up, m00, m01, m02, m10, m11, m12);
+        return;
+    }
+
+    std::vector<std::thread> workers;
+    workers.reserve(nth);
+    A_long band = (h + (A_long)nth - 1) / (A_long)nth;
+    for (unsigned t = 0; t < nth; t++)
+    {
+        A_long y0 = (A_long)t * band;
+        A_long y1 = std::min(h, y0 + band);
+        if (y0 >= y1) break;
+        workers.emplace_back(CompositeRows, y0, y1, curW, curFmt, prevW, hasPrev, outW, up,
+                             m00, m01, m02, m10, m11, m12);
+    }
+    for (auto& t : workers) t.join();
 }
 
 // ---------------------------------------------------------------- cache callbacks
@@ -233,7 +278,7 @@ static A_Err FBCompute(AEGP_CCComputeOptionsRefconP optionsP, AEGP_CCComputeValu
 static size_t FBApproxSize(AEGP_CCComputeValueRefconP valueP)
 {
     FBFrameValue* v = (FBFrameValue*)valueP;
-    return v ? (size_t)v->width * (size_t)v->height * 16 : 0;
+    return v ? (size_t)v->width * (size_t)v->height * 8 : 0;   // ARGB64
 }
 
 static void FBDeleteValue(AEGP_CCComputeValueRefconP valueP)
@@ -310,7 +355,7 @@ static PF_Err FBComputeFrame(FBOptions* o, PF_EffectWorld** outWorldPP)
         (in_dataP->inter.checkin_param)(in_dataP->effect_ref, &cur_def);
         return PF_Err_OUT_OF_MEMORY;
     }
-    ERR(ws->PF_NewWorld(in_dataP->effect_ref, w, h, FALSE, PF_PixelFormat_ARGB128, outW));
+    ERR(ws->PF_NewWorld(in_dataP->effect_ref, w, h, FALSE, PF_PixelFormat_ARGB64, outW));
     if (!err)
     {
         CompositeFrame(curW, curFmt, prevW, hasPrev, outW, &o->params);
@@ -533,40 +578,38 @@ static PF_Err SmartRender(PF_InData* in_dataP, PF_OutData* out_dataP, PF_SmartRe
             cache->AEGP_GetReceiptComputeValue(receipt, (AEGP_CCComputeValueRefconP*)&v);
             if (v && v->world)
             {
-                // blit the cached 32f frame into the output world (any depth)
+                // blit the cached 16-bit frame into the output world (any depth)
                 PF_PixelFormat outFmt = PF_PixelFormat_INVALID;
                 ERR(ws->PF_GetPixelFormat(output_worldP, &outFmt));
                 A_long w = v->world->width < output_worldP->width ? v->world->width : output_worldP->width;
                 A_long h = v->world->height < output_worldP->height ? v->world->height : output_worldP->height;
                 for (A_long y = 0; y < h && !err; y++)
                 {
-                    const PF_PixelFloat* srcRow =
-                        (const PF_PixelFloat*)((const char*)v->world->data + (size_t)y * (size_t)v->world->rowbytes);
+                    const PF_Pixel16* srcRow =
+                        (const PF_Pixel16*)((const char*)v->world->data + (size_t)y * (size_t)v->world->rowbytes);
                     char* dstRow = (char*)output_worldP->data + (size_t)y * (size_t)output_worldP->rowbytes;
                     for (A_long x = 0; x < w; x++)
                     {
-                        const PF_PixelFloat* s = srcRow + x;
+                        const PF_Pixel16* s = srcRow + x;
+                        float fr = s->red / 32768.f, fg = s->green / 32768.f, fb = s->blue / 32768.f, fa = s->alpha / 32768.f;
                         switch (outFmt)
                         {
                         case PF_PixelFormat_ARGB32: {
                             PF_Pixel8* d = ((PF_Pixel8*)dstRow) + x;
-                            d->red = (A_u_char)(Clamp01(s->red) * 255.f + 0.5f);
-                            d->green = (A_u_char)(Clamp01(s->green) * 255.f + 0.5f);
-                            d->blue = (A_u_char)(Clamp01(s->blue) * 255.f + 0.5f);
-                            d->alpha = (A_u_char)(Clamp01(s->alpha) * 255.f + 0.5f);
+                            d->red = (A_u_char)(Clamp01(fr) * 255.f + 0.5f);
+                            d->green = (A_u_char)(Clamp01(fg) * 255.f + 0.5f);
+                            d->blue = (A_u_char)(Clamp01(fb) * 255.f + 0.5f);
+                            d->alpha = (A_u_char)(Clamp01(fa) * 255.f + 0.5f);
                             break;
                         }
                         case PF_PixelFormat_ARGB64: {
                             PF_Pixel16* d = ((PF_Pixel16*)dstRow) + x;
-                            d->red = (A_u_short)(Clamp01(s->red) * 32768.f);
-                            d->green = (A_u_short)(Clamp01(s->green) * 32768.f);
-                            d->blue = (A_u_short)(Clamp01(s->blue) * 32768.f);
-                            d->alpha = (A_u_short)(Clamp01(s->alpha) * 32768.f);
+                            *d = *s;
                             break;
                         }
                         case PF_PixelFormat_ARGB128: {
                             PF_PixelFloat* d = ((PF_PixelFloat*)dstRow) + x;
-                            *d = *s;
+                            d->red = fr; d->green = fg; d->blue = fb; d->alpha = fa;
                             break;
                         }
                         default:

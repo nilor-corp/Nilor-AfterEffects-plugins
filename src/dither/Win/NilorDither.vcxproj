@@ -32,7 +32,7 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <AdditionalIncludeDirectories>$(AeSdkDir)\Headers;$(AeSdkDir)\Headers\SP;$(AeSdkDir)\Headers\Win;$(AeSdkDir)\Resources;$(AeSdkDir)\Util;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_WINDOWS;MSWindows;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;MSWindows;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PreprocessorDefinitions Condition="'$(Configuration)'=='Debug'">_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PreprocessorDefinitions Condition="'$(Configuration)'=='Release'">NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebug</RuntimeLibrary>
@@ -55,7 +55,7 @@
   <ItemGroup>
     <CustomBuild Include="..\DitherKernel.hlsl">
       <FileType>Document</FileType>
-      <Command>if not exist "$(IntDir)DirectX_Assets" mkdir "$(IntDir)DirectX_Assets"
+      <Command>if not exist "$(IntDir)DirectX_Assets" mkdir "$(IntDir)DirectX_Assets"
 "$(DxcExe)" "%(FullPath)" -E main -Fo "$(IntDir)DirectX_Assets\DitherKernel.cso" -Frs "$(IntDir)DirectX_Assets\DitherKernel.rs" -T cs_6_5 -enable-16bit-types -ignore-line-directives</Command>
       <Message>Compiling %(Filename).hlsl with dxc</Message>
       <Outputs>$(IntDir)DirectX_Assets\DitherKernel.cso;$(IntDir)DirectX_Assets\DitherKernel.rs</Outputs>
