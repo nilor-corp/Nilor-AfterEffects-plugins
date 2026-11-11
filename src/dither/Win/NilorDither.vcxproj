@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{351A07CE-DE97-4D14-9635-3662B36ED4FF}</ProjectGuid>
+    <RootNamespace>NilorDither</RootNamespace>
+    <ProjectName>NilorDither</ProjectName>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseOfMfc>false</UseOfMfc>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)$(IntDir)</OutDir>
+    <IntDir>$(ProjectDir)obj\$(Configuration)\</IntDir>
+    <TargetExt>.aex</TargetExt>
+    <IgnoreImportLibrary>true</IgnoreImportLibrary>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(AeSdkDir)\Headers;$(AeSdkDir)\Headers\SP;$(AeSdkDir)\Headers\Win;$(AeSdkDir)\Resources;$(AeSdkDir)\Util;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;MSWindows;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(Configuration)'=='Debug'">_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(Configuration)'=='Release'">NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebug</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Release'">MultiThreaded</RuntimeLibrary>
+      <WarningLevel>Level3</WarningLevel>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>d3d12.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <ModuleDefinitionFile />
+      <SubSystem>Windows</SubSystem>
+    </Link>
+    <ResourceCompile>
+      <Culture>0x0409</Culture>
+    </ResourceCompile>
+  </ItemDefinitionGroup>
+
+  <!-- HLSL -> cso/rs via dxc -->
+  <ItemGroup>
+    <CustomBuild Include="..\DitherKernel.hlsl">
+      <FileType>Document</FileType>
+      <Command>if not exist "$(IntDir)DirectX_Assets" mkdir "$(IntDir)DirectX_Assets"
+"$(DxcExe)" "%(FullPath)" -E main -Fo "$(IntDir)DirectX_Assets\DitherKernel.cso" -Frs "$(IntDir)DirectX_Assets\DitherKernel.rs" -T cs_6_5 -enable-16bit-types -ignore-line-directives</Command>
+      <Message>Compiling %(Filename).hlsl with dxc</Message>
+      <Outputs>$(IntDir)DirectX_Assets\DitherKernel.cso;$(IntDir)DirectX_Assets\DitherKernel.rs</Outputs>
+    </CustomBuild>
+  </ItemGroup>
+
+  <!-- PiPL: .r -> cl /EP -> .rr -> PiPLTool -> .rrc -> cl /EP -> .rc (in this dir) -->
+  <ItemGroup>
+    <CustomBuild Include="..\NilorDitherPiPL.r">
+      <Command>cl /I "$(AeSdkDir)\Headers" /EP "..\NilorDitherPiPL.r" &gt; "$(IntDir)NilorDitherPiPL.rr"
+"$(AeSdkDir)\Resources\PiPLtool" "$(IntDir)NilorDitherPiPL.rr" "$(IntDir)NilorDitherPiPL.rrc"
+cl /D "MSWindows" /EP "$(IntDir)NilorDitherPiPL.rrc" &gt; "$(ProjectDir)NilorDitherPiPL.rc"</Command>
+      <Message>Compiling the PiPL</Message>
+      <Outputs>$(ProjectDir)NilorDitherPiPL.rc</Outputs>
+    </CustomBuild>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClCompile Include="$(AeSdkDir)\Util\DirectXUtils.cpp" />
+    <ClCompile Include="$(AeSdkDir)\Util\Smart_Utils.cpp" />
+    <ClCompile Include="..\NilorDither.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="NilorDitherPiPL.rc" />
+  </ItemGroup>
+
+  <!-- ship: dist\ in the repo + best-effort copy into AE's Plug-ins folder -->
+  <Target Name="Ship" AfterTargets="Build">
+    <MakeDir Directories="$(NilorDistDir)DirectX_Assets" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(NilorDistDir)" />
+    <Copy SourceFiles="$(IntDir)DirectX_Assets\DitherKernel.cso;$(IntDir)DirectX_Assets\DitherKernel.rs" DestinationFolder="$(NilorDistDir)DirectX_Assets" Condition="'$(Configuration)'=='Release'" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(AePluginsDir)" ContinueOnError="WarnAndContinue" Condition="'$(Configuration)'=='Release'" />
+    <Copy SourceFiles="$(IntDir)DirectX_Assets\DitherKernel.cso;$(IntDir)DirectX_Assets\DitherKernel.rs" DestinationFolder="$(AePluginsDir)\DirectX_Assets" ContinueOnError="WarnAndContinue" Condition="'$(Configuration)'=='Release'" />
+  </Target>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Shared settings for all Nilor AE plugins. -->
+<Project>
+  <PropertyGroup>
+    <!-- AE SDK 27 (Examples subtree contains Headers/, Util/, Resources/). Override with /p:AeSdkDir=... -->
+    <AeSdkDir Condition="'$(AeSdkDir)'==''">C:\Users\accou\Downloads\AfterEffectsSDK_27.0.0_win\AfterEffectsSDK\Examples</AeSdkDir>
+    <!-- DirectX Shader Compiler from the Windows SDK -->
+    <DxcExe Condition="'$(DxcExe)'==''">C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe</DxcExe>
+    <!-- where .aex + DirectX_Assets land -->
+    <NilorDistDir Condition="'$(NilorDistDir)'==''">$(MSBuildThisFileDirectory)dist\</NilorDistDir>
+    <!-- AE 2027 plug-ins folder (post-build copy is best-effort; needs the folder to be writable) -->
+    <AePluginsDir Condition="'$(AePluginsDir)'==''">C:\Program Files\Adobe\Adobe After Effects 2027\Support Files\Plug-ins</AePluginsDir>
+  </PropertyGroup>
+</Project>
