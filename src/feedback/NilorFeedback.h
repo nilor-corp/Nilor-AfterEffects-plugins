@@ -32,7 +32,7 @@
 #define DESCRIPTION "Recursive frame feedback: decay + transform the previous frame, composite under the current one."
 
 #define MAJOR_VERSION    1
-#define MINOR_VERSION    3
+#define MINOR_VERSION    4
 #define BUG_VERSION      0
 #define STAGE_VERSION    PF_Stage_RELEASE
 #define BUILD_VERSION    1

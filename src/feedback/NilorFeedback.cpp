@@ -32,8 +32,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <thread>
+#include <chrono>
 #include <vector>
 #include <algorithm>
+#include <stdio.h>
+
+// TEMP DEBUG (v1.3): append diagnostics to a log file; remove once RQ path is proven
+static void FBLog(const char* fmt, ...)
+{
+    FILE* f = NULL;
+    if (fopen_s(&f, "C:\\Users\\accou\\Documents\\ae-mcp-bridge\\nilor_feedback_debug.log", "a") != 0 || !f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
 
 // ---------------------------------------------------------------- params / state
 
@@ -50,14 +65,16 @@ typedef struct
 // everything a cache entry for one frame depends on
 typedef struct
 {
-    const PF_InData* in_dataP;    // valid during the SmartRender call that drives the compute chain
+    const PF_InData* in_dataP;    // valid during the SmartRender call that drives the compute
+    const PF_EffectWorld* inWorld; // the current frame's input (full res, checked out by SmartRender)
+    PF_PixelFormat   inFmt;
     A_long           time;
     A_long           timeStep;
     A_u_long         timeScale;
     A_long           generation;  // bump on Reset
     FeedbackUserParams params;
     PF_State         inputState;  // content identity of the source layer
-    int              depth;       // recursion guard
+    int              depth;       // (unused since v1.4: no recursion)
 } FBOptions;
 
 // cached value: one composited frame as a 16-bit ARGB CPU world (4x smaller than float;
@@ -78,7 +95,7 @@ typedef struct
 
 static const char* kCacheClass = "com.nilor.feedback.frame.v1";
 
-#define FB_MAX_DEPTH 4000   // recursion guard (70 s @ 60 fps); a longer chain resets instead
+// (v1.4: no recursion — see FBCompute header note)
 
 // ---------------------------------------------------------------- helpers
 
@@ -98,21 +115,23 @@ static void BuildInverseTransform(
     *m12 = (float)(cy + sn * (cx + offX) - cs * (cy + offY));
 }
 
-// FNV-1a over raw bytes into 128 bits
-static void HashBytes(AEGP_CCComputeKeyP key, const void* data, size_t len, A_long salt)
+// FNV-1a over raw bytes, accumulating into h0/h1 (call repeatedly, then finalize)
+typedef struct { unsigned long long h0, h1; } FBHash;
+static void HashAccum(FBHash* h, const void* data, size_t len)
 {
     const unsigned char* p = (const unsigned char*)data;
-    unsigned long long h0 = 1469598103934665603ULL ^ (unsigned long long)salt;
-    unsigned long long h1 = 1099511628211ULL ^ (unsigned long long)(salt * 2654435761u);
     for (size_t i = 0; i < len; i++)
     {
-        h0 = (h0 ^ p[i]) * 1099511628211ULL;
-        h1 = (h1 ^ (p[i] + (unsigned char)(i & 7))) * 14029467366897019727ULL;
+        h->h0 = (h->h0 ^ p[i]) * 1099511628211ULL;
+        h->h1 = (h->h1 ^ (p[i] + (unsigned char)(i & 7))) * 14029467366897019727ULL;
     }
-    key->bytes[0] = (A_long)(h0 & 0xFFFFFFFF);
-    key->bytes[1] = (A_long)(h0 >> 32);
-    key->bytes[2] = (A_long)(h1 & 0xFFFFFFFF);
-    key->bytes[3] = (A_long)(h1 >> 32);
+}
+static void HashFinal(FBHash* h, AEGP_CCComputeKeyP key)
+{
+    key->bytes[0] = (A_long)(h->h0 & 0xFFFFFFFF);
+    key->bytes[1] = (A_long)(h->h0 >> 32);
+    key->bytes[2] = (A_long)(h->h1 & 0xFFFFFFFF);
+    key->bytes[3] = (A_long)(h->h1 >> 32);
 }
 
 // ---------------------------------------------------------------- pixel conversion
@@ -411,36 +430,20 @@ static A_Err FBGenerateKey(AEGP_CCComputeOptionsRefconP optionsP, AEGP_CCCompute
 {
     FBOptions* o = (FBOptions*)optionsP;
     // the key must capture: which instance, which frame, which params, what content, which reset era
-    HashBytes(out_keyP, &o->in_dataP->effect_ref, sizeof(o->in_dataP->effect_ref), 11);
-    HashBytes(out_keyP, &o->time, sizeof(o->time), out_keyP->bytes[0]);
-    HashBytes(out_keyP, &o->timeStep, sizeof(o->timeStep), out_keyP->bytes[1]);
-    HashBytes(out_keyP, &o->generation, sizeof(o->generation), out_keyP->bytes[2]);
-    HashBytes(out_keyP, &o->params, sizeof(o->params), out_keyP->bytes[3]);
-    HashBytes(out_keyP, &o->inputState, sizeof(o->inputState), 77);
+    // (v1.1 bug: each HashBytes call overwrote the whole key -> all frames collided. Accumulate properly.)
+    FBHash h = { 1469598103934665603ULL, 1099511628211ULL };
+    HashAccum(&h, &o->in_dataP->effect_ref, sizeof(o->in_dataP->effect_ref));
+    HashAccum(&h, &o->time, sizeof(o->time));
+    HashAccum(&h, &o->timeStep, sizeof(o->timeStep));
+    HashAccum(&h, &o->timeScale, sizeof(o->timeScale));
+    HashAccum(&h, &o->generation, sizeof(o->generation));
+    HashAccum(&h, &o->params, sizeof(o->params));
+    HashAccum(&h, &o->inputState, sizeof(o->inputState));
+    HashFinal(&h, out_keyP);
     return A_Err_NONE;
 }
 
-// forward decl for recursion
-static PF_Err FBComputeFrame(FBOptions* o, PF_EffectWorld** outWorldPP);
-
-static A_Err FBCompute(AEGP_CCComputeOptionsRefconP optionsP, AEGP_CCComputeValueRefconP* out_valuePP)
-{
-    FBOptions* o = (FBOptions*)optionsP;
-    PF_Err err = PF_Err_NONE;
-
-    PF_EffectWorld* world = NULL;
-    err = FBComputeFrame(o, &world);
-    if (err || !world) return (A_Err)err;
-
-    FBFrameValue* v = (FBFrameValue*)malloc(sizeof(FBFrameValue));
-    if (!v) return A_Err_ALLOC;
-    v->world = world;
-    v->pica = o->in_dataP->pica_basicP;
-    v->width = world->width;
-    v->height = world->height;
-    *out_valuePP = v;
-    return A_Err_NONE;
-}
+static A_Err FBCompute(AEGP_CCComputeOptionsRefconP optionsP, AEGP_CCComputeValueRefconP* out_valuePP);
 
 static size_t FBApproxSize(AEGP_CCComputeValueRefconP valueP)
 {
@@ -461,83 +464,102 @@ static void FBDeleteValue(AEGP_CCComputeValueRefconP valueP)
     free(v);
 }
 
-// render one frame into a fresh ARGB128 world (checkout input at that time, pull the
-// previous frame from the cache — computing it recursively on a miss)
-static PF_Err FBComputeFrame(FBOptions* o, PF_EffectWorld** outWorldPP)
+// render one frame into a fresh ARGB64 world. v1.4: the input comes from SmartRender's own
+// full-res checkout (options->inWorld), the previous frame is a READ-ONLY cache lookup — no
+// past-time layer checkouts (they return thumbnail-sized worlds) and no recursion (MFR makes
+// recursive chains unreliable). A jump in time = the previous frame simply isn't in the cache
+// = reset, matching the TD feedback node contract.
+static A_Err FBCompute(AEGP_CCComputeOptionsRefconP optionsP, AEGP_CCComputeValueRefconP* out_valuePP)
 {
+    FBOptions* o = (FBOptions*)optionsP;
     PF_Err err = PF_Err_NONE;
     const PF_InData* in_dataP = o->in_dataP;
+
+    if (!o->inWorld) return A_Err_STRUCT;
 
     AEFX_SuiteScoper<PF_WorldSuite2> ws(const_cast<SPBasicSuite*>(in_dataP->pica_basicP), kPFWorldSuite, kPFWorldSuiteVersion2);
     AEFX_SuiteScoper<AEGP_ComputeCacheSuite1> cache(
         const_cast<SPBasicSuite*>(in_dataP->pica_basicP), kAEGPComputeCacheSuite, kAEGPComputeCacheSuiteVersion1);
 
-    // current input at time o->time (checkout by param index works for arbitrary times)
-    PF_ParamDef cur_def;
-    AEFX_CLR_STRUCT(cur_def);
-    ERR((in_dataP->inter.checkout_param)(
-        in_dataP->effect_ref, FB_INPUT, o->time, o->timeStep, o->timeScale, &cur_def));
-    if (err) return err;
-
-    PF_EffectWorld* curW = &cur_def.u.ld;
-    PF_PixelFormat curFmt = PF_PixelFormat_INVALID;
-    ERR(ws->PF_GetPixelFormat(curW, &curFmt));
-
+    const PF_EffectWorld* curW = o->inWorld;
     A_long w = curW->width, h = curW->height;
-    if (w <= 0 || h <= 0)
-    {
-        (in_dataP->inter.checkin_param)(in_dataP->effect_ref, &cur_def);
-        return PF_Err_INTERNAL_STRUCT_DAMAGED;
-    }
+    if (w <= 0 || h <= 0) return A_Err_STRUCT;
 
-    // previous frame from the cache
-    PF_EffectWorld* prevW = NULL;
+    // previous frame: read-only lookup with a bounded wait. Under MFR, frames dispatch to
+    // threads out of order; a sibling thread computes the previous frame concurrently, so a
+    // miss usually resolves in milliseconds. Deadline + abort prevent pathological stalls;
+    // timing out = treat as chain start (reset), never wrong pixels.
+    const PF_EffectWorld* prevW = NULL;
     PF_Boolean hasPrev = FALSE;
     AEGP_CCCheckoutReceiptP receipt = NULL;
 
     A_long prevTime = o->time - o->timeStep;
-    if (prevTime >= 0 && o->depth < FB_MAX_DEPTH)
+    if (prevTime >= 0)
     {
         FBOptions prevO = *o;
         prevO.time = prevTime;
-        prevO.depth = o->depth + 1;
-        A_Err cerr = cache->AEGP_ComputeIfNeededAndCheckout(kCacheClass, &prevO, true, &receipt);
-        if (cerr == A_Err_NONE && receipt)
+        prevO.inWorld = NULL;   // key only uses time/state; inWorld isn't hashed
+
+        long waitedMs = 0;
+        while (true)
         {
-            FBFrameValue* prevV = NULL;
-            cache->AEGP_GetReceiptComputeValue(receipt, (AEGP_CCComputeValueRefconP*)&prevV);
-            if (prevV && prevV->world && prevV->world->width == w && prevV->world->height == h)
+            A_Err cerr = cache->AEGP_CheckoutCached(kCacheClass, &prevO, &receipt);
+            if (cerr == A_Err_NONE && receipt)
             {
-                prevW = prevV->world;
-                hasPrev = TRUE;
+                FBFrameValue* prevV = NULL;
+                cache->AEGP_GetReceiptComputeValue(receipt, (AEGP_CCComputeValueRefconP*)&prevV);
+                if (prevV && prevV->world && prevV->world->width == w && prevV->world->height == h)
+                {
+                    prevW = prevV->world;
+                    hasPrev = TRUE;
+                }
+                break;
             }
+            if (receipt) { cache->AEGP_CheckinComputeReceipt(receipt); receipt = NULL; }
+
+            if (in_dataP->inter.abort && in_dataP->inter.abort(in_dataP->effect_ref)) break;
+            if (waitedMs >= 3000) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            waitedMs += 5;
         }
+        if (waitedMs > 50) FBLog("[compute] t=%d waited %ldms for prev", (int)o->time, waitedMs);
     }
+    FBLog("[compute] t=%d hasPrev=%d (cache %s)", (int)o->time, (int)hasPrev, hasPrev ? "hit" : "miss");
 
     // composite into a fresh world (struct is ours; AE owns the pixels until we dispose)
     PF_EffectWorld* outW = (PF_EffectWorld*)malloc(sizeof(PF_EffectWorld));
     if (!outW)
     {
         if (receipt) cache->AEGP_CheckinComputeReceipt(receipt);
-        (in_dataP->inter.checkin_param)(in_dataP->effect_ref, &cur_def);
-        return PF_Err_OUT_OF_MEMORY;
+        return A_Err_ALLOC;
     }
     ERR(ws->PF_NewWorld(in_dataP->effect_ref, w, h, FALSE, PF_PixelFormat_ARGB64, outW));
     if (!err)
     {
-        CompositeFrame(curW, curFmt, prevW, hasPrev, outW, &o->params);
+        CompositeFrame(curW, o->inFmt, prevW, hasPrev, outW, &o->params);
     }
 
     if (receipt) cache->AEGP_CheckinComputeReceipt(receipt);
-    (in_dataP->inter.checkin_param)(in_dataP->effect_ref, &cur_def);
 
-    if (!err && outW)
+    if (err || !outW)
     {
-        *outWorldPP = outW;
-        return PF_Err_NONE;
+        if (outW) { ws->PF_DisposeWorld(in_dataP->effect_ref, outW); free(outW); }
+        return err ? (A_Err)err : (A_Err)A_Err_STRUCT;
     }
-    if (outW) ws->PF_DisposeWorld(in_dataP->effect_ref, outW);
-    return err ? err : PF_Err_INTERNAL_STRUCT_DAMAGED;
+
+    FBFrameValue* v = (FBFrameValue*)malloc(sizeof(FBFrameValue));
+    if (!v)
+    {
+        ws->PF_DisposeWorld(in_dataP->effect_ref, outW);
+        free(outW);
+        return A_Err_ALLOC;
+    }
+    v->world = outW;
+    v->pica = in_dataP->pica_basicP;
+    v->width = w;
+    v->height = h;
+    *out_valuePP = v;
+    return A_Err_NONE;
 }
 
 // ---------------------------------------------------------------- effect commands
@@ -720,14 +742,26 @@ static PF_Err SmartRender(PF_InData* in_dataP, PF_OutData* out_dataP, PF_SmartRe
     AEFX_SuiteScoper<PF_ParamUtilsSuite3> paramUtils =
         AEFX_SuiteScoper<PF_ParamUtilsSuite3>(in_dataP, kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, out_dataP);
 
+    // v1.4: the input comes from SmartRender's own full-res checkout (never from a
+    // past-time param checkout — those return thumbnail-sized worlds)
+    PF_EffectWorld* input_worldP = NULL;
     PF_EffectWorld* output_worldP = NULL;
+    ERR(extraP->cb->checkout_layer_pixels(in_dataP->effect_ref, FB_INPUT, &input_worldP));
     ERR(extraP->cb->checkout_output(in_dataP->effect_ref, &output_worldP));
-    if (err || !output_worldP) return err ? err : PF_Err_INTERNAL_STRUCT_DAMAGED;
+    if (err || !output_worldP || !input_worldP)
+    {
+        FBLog("[smartrender] checkout failed err=%d in=%p out=%p", (int)err, input_worldP, output_worldP);
+        if (input_worldP) extraP->cb->checkin_layer_pixels(in_dataP->effect_ref, FB_INPUT);
+        return err ? err : PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
 
     // build the frame options
     FBOptions o;
     memset(&o, 0, sizeof(o));
     o.in_dataP = in_dataP;
+    o.inWorld = input_worldP;
+    o.inFmt = PF_PixelFormat_INVALID;
+    ws->PF_GetPixelFormat(input_worldP, &o.inFmt);
     o.time = in_dataP->current_time;
     o.timeStep = in_dataP->time_step;
     o.timeScale = in_dataP->time_scale;
@@ -747,6 +781,7 @@ static PF_Err SmartRender(PF_InData* in_dataP, PF_OutData* out_dataP, PF_SmartRe
     {
         AEGP_CCCheckoutReceiptP receipt = NULL;
         A_Err cerr = cache->AEGP_ComputeIfNeededAndCheckout(kCacheClass, &o, true, &receipt);
+        FBLog("[smartrender] cache checkout t=%d -> err=%d receipt=%p", (int)o.time, (int)cerr, receipt);
         if (cerr == A_Err_NONE && receipt)
         {
             FBFrameValue* v = NULL;
@@ -795,16 +830,18 @@ static PF_Err SmartRender(PF_InData* in_dataP, PF_OutData* out_dataP, PF_SmartRe
                 }
             }
             cache->AEGP_CheckinComputeReceipt(receipt);
+            FBLog("[smartrender] blit done err=%d", (int)err);
         }
         else if (!err)
         {
+            FBLog("[smartrender] cache MISS/fail cerr=%d", (int)cerr);
             err = PF_Err_INTERNAL_STRUCT_DAMAGED;
         }
     }
 
-    if (output_worldP)
+    if (input_worldP)
     {
-        err2 = PF_Err_NONE; // output world needs no checkin
+        err2 = extraP->cb->checkin_layer_pixels(in_dataP->effect_ref, FB_INPUT);
     }
     if (!err) err = err2;
     return err;
